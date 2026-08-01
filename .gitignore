@@ -1,1 +1,24 @@
+.idea/*
+*.iml
+*.pyc
+.DS_Store
+.vagrant.v1*
+.tags*
+/.gradle/
+/out/
+/build/
+.jira-url
+*.ipr
+*.iws
+.sdkmanrc
+.idea
+.python-version
+.claude/settings.local.json
+.env
+.zed
+CLAUDE.local.md
+.memsearch/
++# roborev snapshots
++/.roborev/
 /target
+
