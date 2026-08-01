@@ -32,14 +32,15 @@ callers write `spec_flow::GlobalConfig`, not
 | `vcs/` | The [`Vcs`] trait (the git/gh subprocess seam), [`ShellVcs`] (real), [`FakeVcs`] (test double) | #3: fill in `ShellVcs`'s `todo!()` bodies in `vcs/shell.rs` — subprocess invocation, output parsing, `gh api graphql` query bodies. Do not touch `vcs/mod.rs`'s trait signatures without updating every caller; do not touch `vcs/fake.rs` unless the trait itself grows a method |
 | `init.rs` | The `spec-flow init` business logic ([`init`]) | #4: composes `config`, `registry`, `scaffold`, and an injected [`Vcs`] |
 | `scaffold.rs` | The committed `.spec-flow/` files `init` materializes: the default `workflow.yaml` (§11.3) and one `instructions/<point>.md` per injection point (§9.1) | #4: the instruction files hold placeholders — authoring real base templates is the instruction composer's step (§14 step 6) |
+| `spawner/` | The `claude` process spawner + `LocalProcess` map ([`ProcessSpawner`]): command-template interpolation, spawn/track/reap, same-instance double-spawn blocking (§2.6, §4.2, §5) | #3 (this step); no MCP server or phase engine exists yet, so nothing in this crate calls it — a later task (§14 step 6+) wires it into the phase engine |
 | `main.rs` (binary, not part of this library) | `clap` CLI wiring, `tracing` setup, `anyhow` error reporting at the top level | #4 for `init`'s wiring; the `serve` subcommand (the MCP server itself) is out of scope until spec §14 step 3+ |
 
 # What is deliberately *not* here yet
 
 Per spec §14 step 1's scope, this crate has no async runtime, no MCP
-crate, and no phase engine / scheduler / process spawner — those are
-later steps (§14 steps 2–10). When the MCP server itself is built (step
-6+), the official Rust SDK is
+crate, and no phase engine / scheduler — those are later steps (§14
+steps 4–10). When the MCP server itself is built (step 6+), the
+official Rust SDK is
 [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk); pull it in
 (with `tokio`) at that point, not before.
 */
@@ -57,6 +58,9 @@ pub use crate::registry::{
     list_projects, remove_project,
 };
 pub use crate::scaffold::ScaffoldError;
+pub use crate::spawner::{
+    LocalProcessEntry, ProcessSpawner, SpawnError, SpawnKey, SpawnToken,
+};
 pub use crate::vcs::{
     FakeVcs, IssueRef, IssueRelationships, IssueState, PullRequestRef,
     ShellVcs, Vcs, VcsError, Worktree,
@@ -66,4 +70,5 @@ mod config;
 mod init;
 mod registry;
 mod scaffold;
+mod spawner;
 mod vcs;
