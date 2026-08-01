@@ -563,6 +563,57 @@ impl Vcs for ShellVcs {
         Ok(())
     }
 
+    fn ensure_label(&self, repo: &str, label: &str) -> Result<(), VcsError> {
+        // Checks existence first via `gh label list --search`, rather
+        // than calling `gh label create --force` unconditionally:
+        // `--force` PATCHes an already-existing label, and its
+        // `--color` argument would silently repaint whatever color a
+        // team's own P0-P3/status labels already had — a real,
+        // `gh`-source-confirmed clobber this crate's `init` should no
+        // more commit than it commits `scaffold_spec_flow_dir`'s
+        // file-clobbering.
+        //
+        // Deliberately NOT `gh api repos/{owner}/{repo}/labels/{label}`
+        // (GitHub's "get a label" endpoint, the more obvious existence
+        // check): `gh api`'s endpoint argument runs through `gh`'s own
+        // `:owner`/`:repo`/`:branch` placeholder substitution (confirmed
+        // in `cli/cli`'s `pkg/cmd/api/api.go`) with no word-boundary
+        // guard, so a label whose name happened to contain `:repo` or
+        // `:branch` immediately followed by a word character (e.g. a
+        // team-added `gate:repository-sync`) would have that substring
+        // silently rewritten inside the request path. `--search` is an
+        // ordinary CLI flag value, never routed through that
+        // substitution, so no label name can trigger it — and `--search`
+        // being a fuzzy substring match rather than an exact one doesn't
+        // matter here, since the exact-match check happens client-side
+        // below regardless of how many (or few) candidates it returns.
+        // `--limit` well above `gh label list`'s default page size (30):
+        // a repo with enough same-substring labels to page the exact
+        // match out of the default-sized result would otherwise spuriously
+        // attempt to re-create an already-existing label (a loud,
+        // deterministic "already exists" failure — never a silent
+        // wrong answer — but avoidable outright at negligible cost).
+        let args = ShellVcs::gh_args(
+            &[
+                "label", "list", "--search", label, "--json", "name",
+                "--limit", "999",
+            ],
+            repo,
+        );
+        let existing: Vec<LabelJson> =
+            self.run_json(&self.gh_binary, &args, None)?;
+        if existing.iter().any(|found| found.name == label) {
+            return Ok(());
+        }
+
+        let args = ShellVcs::gh_args(
+            &["label", "create", label, "--color", "ededed"],
+            repo,
+        );
+        self.run_checked(&self.gh_binary, &args, None)?;
+        Ok(())
+    }
+
     fn post_comment(
         &self,
         repo: &str,
@@ -836,7 +887,10 @@ struct IssueJson {
     state: IssueStateJson,
 }
 
-/// One entry of `gh`'s `labels` array.
+/// One entry of `gh`'s `labels` array — both an issue's `labels` field
+/// (`gh issue view --json labels`, used by [`Vcs::read_issue`]) and a
+/// `gh label list --json name` result share this exact `{name}` shape,
+/// so both reuse this one type rather than each declaring their own.
 #[derive(Debug, Deserialize)]
 struct LabelJson {
     name: String,
@@ -1315,6 +1369,79 @@ mod tests {
                 "owner/repo-a",
             ],
         );
+    }
+
+    #[test]
+    fn ensure_label_creates_a_label_that_does_not_exist_yet() {
+        let runner = Arc::new(FakeRunner::new());
+        // First call: the existence check -- an empty search result, the
+        // label isn't there.
+        runner.succeed("[]");
+        // Second call: the create.
+        runner.succeed("");
+        let vcs = shell_vcs(runner.clone());
+
+        vcs.ensure_label("owner/repo-a", "gate:architecture").unwrap();
+
+        let calls = runner.calls();
+        assert_call(
+            &calls[0],
+            "gh",
+            &[
+                "label",
+                "list",
+                "--search",
+                "gate:architecture",
+                "--json",
+                "name",
+                "--limit",
+                "999",
+                "--repo",
+                "owner/repo-a",
+            ],
+        );
+        assert_call(
+            &calls[1],
+            "gh",
+            &[
+                "label",
+                "create",
+                "gate:architecture",
+                "--color",
+                "ededed",
+                "--repo",
+                "owner/repo-a",
+            ],
+        );
+    }
+
+    #[test]
+    fn ensure_label_leaves_an_already_existing_label_untouched() {
+        // The existence check finds it already there -- must not call
+        // `label create` at all, since doing so (even with `--force`)
+        // would repaint whatever color a team's own label already had.
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed(r#"[{"name":"gate:architecture"}]"#);
+        let vcs = shell_vcs(runner.clone());
+
+        vcs.ensure_label("owner/repo-a", "gate:architecture").unwrap();
+
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[test]
+    fn ensure_label_ignores_a_fuzzy_search_match_that_is_not_an_exact_name() {
+        // `--search` is a substring match -- a result set containing a
+        // DIFFERENT label that merely contains the search term must not
+        // be mistaken for the exact label already existing.
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed(r#"[{"name":"gate:architecture-legacy"}]"#);
+        runner.succeed("");
+        let vcs = shell_vcs(runner.clone());
+
+        vcs.ensure_label("owner/repo-a", "gate:architecture").unwrap();
+
+        assert_eq!(runner.calls().len(), 2);
     }
 
     #[test]

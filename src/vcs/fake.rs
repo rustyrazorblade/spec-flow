@@ -67,6 +67,10 @@ pub struct FakeVcs {
     pub pushes: RefCell<Vec<(PathBuf, String)>>,
     /// Labels currently set on each issue, per `(repo, issue_number)`.
     pub labels: RefCell<HashMap<(String, u64), HashSet<String>>>,
+    /// Label names [`Vcs::ensure_label`] has created in each repo's
+    /// label set — repo-scoped, not issue-scoped, since a label's
+    /// existence is a property of the repo, not of any one issue.
+    pub labels_ensured: RefCell<HashMap<String, HashSet<String>>>,
     /// Comments posted on each issue, per `(repo, issue_number)`, in
     /// post order.
     pub comments: RefCell<HashMap<(String, u64), Vec<String>>>,
@@ -116,6 +120,7 @@ impl Default for FakeVcs {
             commits: RefCell::new(Vec::new()),
             pushes: RefCell::new(Vec::new()),
             labels: RefCell::new(HashMap::new()),
+            labels_ensured: RefCell::new(HashMap::new()),
             comments: RefCell::new(HashMap::new()),
             prs_opened: RefCell::new(Vec::new()),
             next_pr_number: Cell::new(1),
@@ -293,6 +298,15 @@ impl Vcs for FakeVcs {
                 issue.labels.retain(|l| l != label);
             }
         }
+        Ok(())
+    }
+
+    fn ensure_label(&self, repo: &str, label: &str) -> Result<(), VcsError> {
+        self.labels_ensured
+            .borrow_mut()
+            .entry(repo.to_string())
+            .or_default()
+            .insert(label.to_string());
         Ok(())
     }
 

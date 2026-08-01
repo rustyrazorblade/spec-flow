@@ -33,6 +33,7 @@ use crate::config::{
 use crate::registry::add_project;
 use crate::scaffold::{ScaffoldError, scaffold_spec_flow_dir};
 use crate::vcs::Vcs;
+use crate::workflow::{WorkflowError, label_vocabulary, parse_workflow};
 
 /// Options accepted by [`init`], mirroring the `init(repo?, project_dir?)`
 /// MCP call and the `spec-flow init` CLI flags (§6).
@@ -62,6 +63,41 @@ pub enum InitError {
     /// A `.spec-flow/` scaffolding file could not be written.
     #[error(transparent)]
     Scaffold(#[from] ScaffoldError),
+
+    /// `.spec-flow/workflow.yaml` could not be read back after
+    /// scaffolding, to derive the label vocabulary to provision (§14
+    /// step 9). Distinct from [`InitError::Scaffold`]: the file was just
+    /// written (or already existed) — this is a *read* failure on a path
+    /// that should exist.
+    #[error("failed to read {path}")]
+    ReadWorkflow {
+        /// The workflow file that could not be read.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// `.spec-flow/workflow.yaml` exists but does not parse (a team
+    /// hand-edit gone wrong). `init` must fail loudly here rather than
+    /// silently skip label provisioning — an unprovisioned label
+    /// vocabulary breaks every later `gate:`/`status:`/`approved:` label
+    /// write against a real GitHub repo (see [`crate::vcs::Vcs::ensure_label`]'s
+    /// doc), a failure mode a human should notice at `init` time, not
+    /// weeks later against a live `serve` daemon.
+    ///
+    /// A named struct variant rather than `#[from] WorkflowError`
+    /// deliberately: `WorkflowError` alone renders as a bare serde_yaml
+    /// message with no mention of *which* file failed to parse, leaving
+    /// a team member to guess.
+    #[error("failed to parse {path}")]
+    Workflow {
+        /// The workflow file that failed to parse.
+        path: PathBuf,
+        /// The underlying parse failure.
+        #[source]
+        source: WorkflowError,
+    },
 
     /// The current working directory could not be read, so the repo to
     /// initialize cannot be resolved.
@@ -201,6 +237,7 @@ fn init_at<V: Vcs>(
     save_global_config(global_config_path, &global_config)?;
 
     scaffold_spec_flow_dir(repo_dir)?;
+    provision_label_vocabulary(vcs, repo_dir, &project_config.repo)?;
 
     tracing::info!(
         project = %project_config.name,
@@ -209,6 +246,49 @@ fn init_at<V: Vcs>(
         merge_mode = ?project_config.merge_mode,
         "initialized project"
     );
+    Ok(())
+}
+
+/// Create every label the repo's **effective** `.spec-flow/workflow.yaml`
+/// vocabulary needs (§14 step 9, [`crate::workflow::label_vocabulary`]),
+/// so every later `gate:`/`status:`/`approved:`/`spec:skip` label write
+/// this daemon makes has somewhere to land — see
+/// [`crate::vcs::Vcs::ensure_label`]'s doc for the real `gh` limitation
+/// this closes.
+///
+/// Reads the workflow file back from disk **after** scaffolding, rather
+/// than assuming the compiled-in default: a re-`init` over a
+/// team-hand-edited `workflow.yaml` (§6 `init`'s "never clobbers an
+/// edited file" contract, honored by [`scaffold_spec_flow_dir`] already
+/// running above) must provision the team's *actual* vocabulary, not the
+/// shipped one it may have since diverged from.
+///
+/// **Known gap:** this only runs when `init` itself runs. The realistic
+/// sequence is `init` (writes the *shipped default* workflow.yaml) →
+/// team edits it afterward (adding a phase, a status, a custom lease
+/// label) → nobody re-runs `init`. That edit's new label names are never
+/// provisioned, and the "surface at `init` time, not weeks later against
+/// a live `serve` daemon" reasoning above only actually holds for the
+/// *re*-`init` case, not this more common one. Closing this needs
+/// something that isn't built yet — `serve` re-provisioning at startup,
+/// or a `workflow.yaml` mtime/hash check — flagged here rather than
+/// silently assumed solved by this function's existence.
+fn provision_label_vocabulary<V: Vcs>(
+    vcs: &V,
+    repo_dir: &Path,
+    repo: &str,
+) -> Result<(), InitError> {
+    let workflow_path = repo_dir.join(".spec-flow").join("workflow.yaml");
+    let workflow_yaml =
+        std::fs::read_to_string(&workflow_path).map_err(|source| {
+            InitError::ReadWorkflow { path: workflow_path.clone(), source }
+        })?;
+    let workflow = parse_workflow(&workflow_yaml).map_err(|source| {
+        InitError::Workflow { path: workflow_path, source }
+    })?;
+    for label in label_vocabulary(&workflow) {
+        vcs.ensure_label(repo, &label)?;
+    }
     Ok(())
 }
 
@@ -425,6 +505,7 @@ mod tests {
     use crate::config::load_project_config;
     use crate::scaffold::{DEFAULT_WORKFLOW_YAML, INSTRUCTION_POINTS};
     use crate::vcs::{FakeVcs, VcsError};
+    use std::collections::HashSet;
     use std::fs;
     use tempfile::TempDir;
 
@@ -578,8 +659,16 @@ mod tests {
 
     #[test]
     fn never_clobbers_an_edited_workflow() {
+        // Minimal but schema-valid (not just any text) -- provisioning
+        // the label vocabulary (see `provision_label_vocabulary`) now
+        // parses whatever is on disk, so this fixture must be a real,
+        // if tiny, workflow.yaml rather than an arbitrary stub.
         let fixture = Fixture::new();
-        let edited = "phases: []   # our own pipeline\n";
+        let edited = "labels: {priority: [P0], status: [a], gate_prefix: \"gate:\", approval_prefix: \"approved:\", owner_prefix: \"owner:\"}\n\
+                       spec: {tool: openspec, optional: false, skip_label: \"spec:skip\"}\n\
+                       review_panel: []\n\
+                       fix_loop: {max_rounds: 1, on_exhausted: escalate, on_decision_finding: escalate}\n\
+                       phases: []   # our own pipeline\n";
         write_file(&fixture.workflow_path(), edited);
 
         fixture.init().unwrap();
@@ -588,6 +677,48 @@ mod tests {
             fs::read_to_string(fixture.workflow_path()).unwrap(),
             edited
         );
+    }
+
+    #[test]
+    fn fails_loudly_when_the_edited_workflow_does_not_parse() {
+        // The label-vocabulary provisioning step (§14 step 9) parses
+        // whatever workflow.yaml is actually on disk -- a hand-edit gone
+        // wrong must fail `init` loudly, not silently skip provisioning
+        // and leave every later gate:/status:/approved: label write
+        // broken against a real repo.
+        let fixture = Fixture::new();
+        write_file(&fixture.workflow_path(), "phases: [this is not valid\n");
+
+        assert!(matches!(
+            fixture.init(),
+            Err(InitError::Workflow {
+                source: WorkflowError::InvalidYaml { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn provisions_exactly_the_default_workflows_label_vocabulary() {
+        // An exact-set comparison against `label_vocabulary` itself,
+        // not a handful of spot-checked examples -- this is an
+        // integration check on init's WIRING (does every label
+        // `label_vocabulary` returns actually reach `ensure_label`,
+        // and nothing else), not a re-verification of `label_vocabulary`'s
+        // own derivation logic, which `workflow::tests` already covers
+        // per label category.
+        let fixture = Fixture::new();
+
+        fixture.init().unwrap();
+
+        let expected: HashSet<String> =
+            label_vocabulary(&parse_workflow(DEFAULT_WORKFLOW_YAML).unwrap())
+                .into_iter()
+                .collect();
+        let ensured = fixture.vcs.labels_ensured.borrow();
+        let ensured =
+            ensured.get(REPO).expect("labels ensured for the repo").clone();
+        assert_eq!(ensured, expected);
     }
 
     #[test]

@@ -334,6 +334,27 @@ pub trait Vcs {
         present: bool,
     ) -> Result<(), VcsError>;
 
+    /// Create `label` in `repo`'s label set if it does not already exist
+    /// (§14 step 9) — the prerequisite [`Vcs::set_label`]'s own doc
+    /// identifies: `gh issue edit --add-label` never auto-creates a
+    /// label name. Idempotent: calling this again for a label that
+    /// already exists is a no-op success, so `spec-flow init`'s
+    /// re-running-is-safe contract (§6 `init`, §11.1) holds for it too —
+    /// and, just as importantly, leaves an already-existing label's
+    /// color/description exactly as a team left them; this is a
+    /// create-if-absent, never an upsert.
+    ///
+    /// Scoped to the **fixed, config-declared** label vocabulary
+    /// (`crate::workflow::label_vocabulary`) — every name this crate ever
+    /// calls this with is known in full at `init` time and never changes
+    /// between calls. This does **not** resolve
+    /// [`crate::claim::write_claim`]'s label-preexistence conflict: that
+    /// one is unresolved because each `owner:<instance>@<epoch>` name is
+    /// different on every heartbeat, so pre-creating it here would mean
+    /// pre-creating a label for every future epoch, which is not what
+    /// this method is for.
+    fn ensure_label(&self, repo: &str, label: &str) -> Result<(), VcsError>;
+
     /// Post a comment on an issue (or PR — GitHub treats PRs as issues
     /// for commenting purposes).
     fn post_comment(

@@ -79,6 +79,89 @@ pub fn parse_workflow(yaml: &str) -> Result<WorkflowConfig, WorkflowError> {
         .map_err(|source| WorkflowError::InvalidYaml { source })
 }
 
+/// Every GitHub label name `workflow` actually uses, for `spec-flow
+/// init` to provision in the repo with [`crate::vcs::Vcs::ensure_label`]
+/// (§14 step 9).
+///
+/// This closes a real, previously-undocumented gap: `gh issue edit
+/// --add-label` cannot create a label that doesn't already exist in the
+/// repo (see `crate::vcs::shell::ShellVcs::set_label`'s doc) — and
+/// unlike [`crate::claim::write_claim`]'s per-heartbeat `owner:<instance>
+/// @<epoch>` labels (a *confirmed, unresolved* conflict, since that name
+/// is different on every single write), every label this function
+/// returns is a **fixed, config-declared name**: creating it once, up
+/// front, at `init` time fully resolves the "must already exist"
+/// requirement for the whole `status:`/`gate:`/`approved:` label surface
+/// this crate's phase engine and gate evaluation depend on.
+///
+/// Returns, sorted and deduplicated:
+/// - `workflow.labels.priority` entries, verbatim (already bare label
+///   names, e.g. `P0`).
+/// - `workflow.labels.status` entries, each prefixed
+///   `crate::state`'s `STATUS_PREFIX` (`status:<entry>`) — **and**,
+///   separately, every [`Phase::status_label`] that is `Some`, also
+///   prefixed. These are two independent sources of the same
+///   `status:*` family: `advance` resolves/writes a phase's status via
+///   [`Phase::status_label`] (plus the `ready` alias, positioned in
+///   `labels.status` — see `advance::READY_STATUS`'s doc), not via
+///   `labels.status` directly. They coincide in the shipped default
+///   (every phase's `status_label` is also a `labels.status` entry),
+///   but nothing enforces that a team keeps them in sync when editing
+///   `workflow.yaml` — a phase whose `status_label` was added without
+///   a matching `labels.status` entry would otherwise hit exactly the
+///   "label doesn't exist" failure this whole function exists to
+///   prevent the moment `advance` tried to stamp it. Reading both
+///   sources closes that gap without requiring the two lists to agree.
+/// - `crate::state`'s `GATE_PREFIX` + every [`Phase::id`]
+///   (`gate:<phase.id>`) — for **every** phase, not only `human`-default
+///   ones, since §4.3 lets an operator add a per-issue `gate:<phase>`
+///   override to *any* phase regardless of its configured default.
+/// - Every [`Phase::approval_label`] that is `Some` (already a
+///   fully-formed `approved:<name>` string).
+/// - [`SpecConfig::skip_label`] (e.g. `spec:skip`).
+///
+/// Deliberately built from `crate::state`'s hard-coded prefix constants
+/// rather than `workflow.labels.gate_prefix`/`approval_prefix` —
+/// [`LabelsConfig`]'s doc already records that those configured prefixes
+/// are parsed but not yet consulted anywhere else in this crate. Reading
+/// them here instead would provision labels under a customized prefix
+/// that [`crate::state::derive_issue_state`] still cannot recognize —
+/// making this function *consistent* with the rest of the crate's
+/// current behavior under that gap, not a second, differently-broken
+/// copy of it.
+pub fn label_vocabulary(workflow: &WorkflowConfig) -> Vec<String> {
+    let mut labels: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    labels.extend(workflow.labels.priority.iter().cloned());
+    labels.extend(
+        workflow
+            .labels
+            .status
+            .iter()
+            .map(|status| format!("{}{status}", crate::state::STATUS_PREFIX)),
+    );
+    labels.extend(workflow.phases.iter().filter_map(|phase| {
+        phase
+            .status_label
+            .as_deref()
+            .map(|status| format!("{}{status}", crate::state::STATUS_PREFIX))
+    }));
+    labels.extend(
+        workflow
+            .phases
+            .iter()
+            .map(|phase| format!("{}{}", crate::state::GATE_PREFIX, phase.id)),
+    );
+    labels.extend(
+        workflow
+            .phases
+            .iter()
+            .filter_map(|phase| phase.approval_label.clone()),
+    );
+    labels.insert(workflow.spec.skip_label.clone());
+    labels.into_iter().collect()
+}
+
 /// The full parsed shape of `.spec-flow/workflow.yaml` (§7.1, §11.3).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct WorkflowConfig {
@@ -827,5 +910,106 @@ phases:
         let workflow = parse_workflow(yaml).unwrap();
 
         assert!(workflow.roborev.is_none());
+    }
+
+    // -- label_vocabulary --
+
+    #[test]
+    fn label_vocabulary_includes_every_priority_level_bare() {
+        let workflow = parse_workflow(DEFAULT_WORKFLOW_YAML).unwrap();
+
+        let labels = label_vocabulary(&workflow);
+
+        for priority in ["P0", "P1", "P2", "P3"] {
+            assert!(labels.contains(&priority.to_string()));
+        }
+    }
+
+    #[test]
+    fn label_vocabulary_prefixes_every_status_entry() {
+        let workflow = parse_workflow(DEFAULT_WORKFLOW_YAML).unwrap();
+
+        let labels = label_vocabulary(&workflow);
+
+        assert!(labels.contains(&"status:product-spec".to_string()));
+        assert!(labels.contains(&"status:done".to_string()));
+        // "ready" has no Phase of its own (see `advance::READY_STATUS`'s
+        // doc) but is still a real status this daemon writes, so it must
+        // still be provisioned.
+        assert!(labels.contains(&"status:ready".to_string()));
+    }
+
+    #[test]
+    fn label_vocabulary_includes_a_phases_status_label_even_when_absent_from_labels_status()
+     {
+        // The exact regression finding #2 fixed: `advance` resolves and
+        // writes a phase's status via `Phase::status_label`, not via
+        // `labels.status` -- a team-added phase whose status_label was
+        // never also added to `labels.status` must still get its label
+        // provisioned, or the very first time `advance` stamps it, the
+        // write hits the "label doesn't exist" failure this whole
+        // function exists to prevent. `labels.status` here deliberately
+        // omits "shipped" to prove this isn't just reading the wrong
+        // list twice.
+        let yaml = r#"
+labels: {priority: [P0], status: [a], gate_prefix: "gate:", approval_prefix: "approved:", owner_prefix: "owner:"}
+spec: {tool: openspec, optional: false, skip_label: "spec:skip"}
+review_panel: []
+fix_loop: {max_rounds: 1, on_exhausted: escalate, on_decision_finding: escalate}
+phases:
+  - {id: ship, action: {type: server, op: noop}, status_label: shipped}
+"#;
+        let workflow = parse_workflow(yaml).unwrap();
+
+        let labels = label_vocabulary(&workflow);
+
+        assert!(labels.contains(&"status:shipped".to_string()));
+    }
+
+    #[test]
+    fn label_vocabulary_includes_a_gate_label_for_every_phase_not_only_human_ones()
+     {
+        let workflow = parse_workflow(DEFAULT_WORKFLOW_YAML).unwrap();
+
+        let labels = label_vocabulary(&workflow);
+
+        // conflict-check's own default is `none`, not `human` -- but
+        // §4.3 lets an operator add a per-issue override to any phase.
+        assert!(labels.contains(&"gate:conflict-check".to_string()));
+        assert!(labels.contains(&"gate:review".to_string()));
+    }
+
+    #[test]
+    fn label_vocabulary_includes_every_configured_approval_label_verbatim() {
+        let workflow = parse_workflow(DEFAULT_WORKFLOW_YAML).unwrap();
+
+        let labels = label_vocabulary(&workflow);
+
+        assert!(labels.contains(&"approved:product-spec".to_string()));
+        // review's approval_label deliberately names the action
+        // ("merge"), not the phase id ("review") -- see
+        // `advance::approval_key`'s doc.
+        assert!(labels.contains(&"approved:merge".to_string()));
+    }
+
+    #[test]
+    fn label_vocabulary_omits_phases_with_no_approval_label() {
+        let workflow = parse_workflow(DEFAULT_WORKFLOW_YAML).unwrap();
+
+        let labels = label_vocabulary(&workflow);
+
+        // conflict-check and finalize have no approval_label at all --
+        // nothing should be fabricated for them.
+        assert!(!labels.contains(&"approved:conflict-check".to_string()));
+        assert!(!labels.contains(&"approved:finalize".to_string()));
+    }
+
+    #[test]
+    fn label_vocabulary_includes_the_spec_skip_label() {
+        let workflow = parse_workflow(DEFAULT_WORKFLOW_YAML).unwrap();
+
+        let labels = label_vocabulary(&workflow);
+
+        assert!(labels.contains(&"spec:skip".to_string()));
     }
 }

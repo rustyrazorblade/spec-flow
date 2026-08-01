@@ -51,7 +51,11 @@ use crate::vcs::{
 pub(crate) const STATUS_PREFIX: &str = "status:";
 
 /// The `gate:<phase>` label prefix (§4.3, §11.3 `labels.gate_prefix`).
-const GATE_PREFIX: &str = "gate:";
+///
+/// `pub(crate)` — see [`STATUS_PREFIX`]; [`crate::workflow::label_vocabulary`]
+/// reuses this same prefix to derive every phase's per-issue gate-override
+/// label name for `spec-flow init` to provision in the repo.
+pub(crate) const GATE_PREFIX: &str = "gate:";
 
 /// The `approved:<phase>` label prefix (§4.3, §11.3
 /// `labels.approval_prefix`).

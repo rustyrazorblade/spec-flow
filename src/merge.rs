@@ -63,8 +63,8 @@
 //!   needing any new repo-wide search capability. **Not yet workable as
 //!   described**, though: [`crate::claim::write_claim`] composes its
 //!   label with the epoch baked into the label *name*
-//!   (`owner:<instance>@<epoch>`), and [`crate::vcs::shell::ShellVcs::
-//!   set_label`]'s doc records a **confirmed** finding (read from `gh`'s
+//!   (`owner:<instance>@<epoch>`), and `crate::vcs::shell::ShellVcs::
+//!   set_label`'s doc records a **confirmed** finding (read from `gh`'s
 //!   own source, not speculation) that `gh issue edit --add-label`
 //!   cannot create a label name that doesn't already exist in the repo
 //!   — so every heartbeat's fresh epoch would fail against a real
@@ -94,15 +94,15 @@
 //!
 //! `spec-flow init`'s merge-queue-enabled check (§8.1's other named
 //! deliverable for this step) is already implemented — see
-//! [`crate::init`]'s `detect_merge_mode` — and needed no changes here.
+//! `crate::init`'s `detect_merge_mode` — and needed no changes here.
 //!
 //! # A pre-existing gap this step surfaced but does not fix
 //!
-//! [`crate::vcs::shell::ShellVcs::enqueue_merge`] (step 1) hard-codes
+//! `crate::vcs::shell::ShellVcs::enqueue_merge` (step 1) hard-codes
 //! `gh pr merge --auto --squash`. A repo whose branch protection
 //! requires the merge queue can reject an explicit strategy flag,
 //! depending on how the queue itself is configured — this was validated
-//! against a [`crate::vcs::shell::runner::FakeRunner`] in step 1, not
+//! against a `crate::vcs::shell::runner::FakeRunner` in step 1, not
 //! against a real repo with the queue enabled and squash merges
 //! disallowed. Not addressed here since it's step 1's code, not this
 //! step's; flagged so it isn't silently assumed to already be solid.

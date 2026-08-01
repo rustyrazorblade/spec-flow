@@ -37,7 +37,7 @@
 //!
 //! Two narrower problems remain even with the merge carve-out above,
 //! flagged here rather than guessed at, following the same pattern as
-//! [`crate::vcs::shell::ShellVcs::set_label`]'s documented gh-label
+//! `crate::vcs::shell::ShellVcs::set_label`'s documented gh-label
 //! conflict:
 //!
 //! - **Stale stamps under an edited config.** An issue created while a
