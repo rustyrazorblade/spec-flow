@@ -40,6 +40,11 @@ mod requires;
 
 use serde::{Deserialize, Deserializer};
 
+/// Crate-internal, unlike everything else re-exported here — see
+/// `advance::is_merge_gate`'s own doc for why `crate::server::logic`
+/// shares this structural definition of the merge gate (§6's
+/// `merge→address` denial routing) rather than restating it.
+pub(crate) use advance::is_merge_gate;
 pub use advance::{
     AdvanceDecision, ApproveDecision, LabelOp, advance, approve,
     handoff_ready_reached, readiness_gap, set_gate,

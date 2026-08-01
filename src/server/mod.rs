@@ -3,9 +3,17 @@
 This is §6's tool surface as far as it is built: the async foundation
 (`tokio` + `rmcp` over streamable HTTP/SSE, loopback), plus **every
 read-only tool under §6's "Board / status" heading** — `register`,
-`board`, `issue`, `backlog`, and `drift`. All five re-derive their
-answer from GitHub on every call (§2.3); none of them writes anything,
-to GitHub or to disk.
+`board`, `issue`, `backlog`, and `drift`, all of which re-derive their
+answer from GitHub on every call (§2.3) and write nothing — plus the
+**first two write-path tools, §6's "Approval & gates" pair**:
+[`approve`](SpecFlowServer::approve) and
+[`set_gate`](SpecFlowServer::set_gate). Both write the GitHub label
+their decision means before returning (§6, §15), then re-read the issue
+so what they return is GitHub's answer rather than an assumption about
+the write.
+
+`approve`'s **deny** closes half of its §6 contract, on purpose — see
+"What this server deliberately does not implement" below.
 
 # The connection *is* the project (§2.5, §6, §15)
 
@@ -50,9 +58,9 @@ step that needs it.
 # What this server deliberately does not implement
 
 Not stubs — absent, and listed here so nobody has to grep for them. Every
-write-path §6 tool: `start_implement`, `submit_artifact`,
-`submit_review`, `create_issue`, `advance`, `cancel_work`, `sync_ci`,
-`address`, `approve`, `set_gate`, `link`, `unlink`,
+write-path §6 tool except the "Approval & gates" pair:
+`start_implement`, `submit_artifact`, `submit_review`, `create_issue`,
+`advance`, `cancel_work`, `sync_ci`, `address`, `link`, `unlink`,
 `acquire_lease`/`heartbeat_lease`/`release_lease`/`lease_status`,
 `report`, and `instructions`. `init` stays a CLI subcommand here rather
 than an MCP tool (§14.1 ships it as one); wiring it as a tool too is a
@@ -60,6 +68,41 @@ later decision, not an omission with a workaround.
 
 Also absent, and each for a stated reason:
 
+- **`approve(deny)`'s re-entry routing** (§6) — the one *half*-built
+  thing here, and the gap to read before touching this tool. §6's deny
+  "records the state + note **and** routes the phase back to its defined
+  re-entry (product-spec→re-groom, architecture→re-propose,
+  test-plan→re-plan, merge→address)". This server does the first half in
+  full — it posts a GitHub comment carrying the decision, the note, and
+  the re-entry the *project's own* workflow defines for that phase
+  (`logic::denial_reentry` derives it structurally: the merge gate
+  re-enters the out-of-band phase declaring `reenters: <that phase>`,
+  i.e. `address` in the shipped default; an agent phase re-enters
+  itself, which is what §6's re-groom/re-propose/re-plan are) — and does
+  **not** do the second at all. It writes no label for a denial and
+  re-runs nothing. Routing means spawning an agent (`address` is an
+  agent phase, §7.2) or re-running a content phase, and no phase engine
+  or spawner runs alongside this server — the same boundary
+  `next_assignment` below is missing for. The result says so in a field
+  of its own ([`wire::ApproveResult::reentry_triggered`], always
+  `false`) rather than leaving a client to infer from a named `reentry`
+  that the workflow moved on.
+
+- **A positive record that `set_gate(auto)` was ever chosen** (§15's
+  "an explicit human action or a **recorded** `auto` choice"). §6
+  defines `set_gate` as "adding/removing the `gate:<phase>` label (the
+  MCP surface of that label)", and one binary label cannot encode three
+  modes: `none` and `auto` both remove it, so a label-absent phase looks
+  identical whether an operator chose `auto` for this issue or never
+  touched it. `crate::workflow::set_gate`'s and `crate::workflow`'s
+  `gate` module docs already record this from the decision and read
+  sides; this tool inherits it rather than minting a marker label
+  nothing else in the crate reads. The case where it would be unsafe is
+  already carved out: the merge gate never *falls back* to `auto` from a
+  `human` default off an absent label (`crate::workflow::effective_gate_mode`,
+  §4.3's "merge is special") — a merge-gate phase configured `auto`
+  outright still resolves to `auto`, which is the recorded-choice case
+  §15 allows, living in the config rather than a per-issue label.
 - **`next_assignment`** (§6) — the one read-shaped tool still missing.
   It returns "the highest-value content phase awaiting an agent per the
   scheduling order (§12)", which is [`crate::schedule::next_action`]'s
@@ -125,9 +168,14 @@ Also absent, and each for a stated reason:
   explicit about which part of it the measurement did *not* exercise).
   Neither fix (§2.3/§5's disposable local cache, or a batched GraphQL
   read) is tuning that belongs in a read-only slice.
-  Nor is the workflow file [`backlog`](SpecFlowServer::backlog) parses
-  per call cached — see `logic`'s `load_workflow` for why re-reading a
-  file a team edits mid-session is the point, not an oversight.
+  Nor is the workflow file [`backlog`](SpecFlowServer::backlog),
+  [`approve`](SpecFlowServer::approve) and
+  [`set_gate`](SpecFlowServer::set_gate) each parse per call cached —
+  see `logic`'s `load_workflow` for why re-reading a file a team edits
+  mid-session is the point, not an oversight. `approve` and `set_gate`
+  are single-issue calls with no open-issue fan-out at all: one or two
+  `gh` invocations for the write, plus [`logic::read_issue`]'s usual
+  three-to-four for the re-read.
 */
 
 mod logic;
@@ -151,13 +199,16 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use crate::config::{GlobalConfig, ProjectConfig};
 use crate::vcs::ShellVcs;
 
-pub use self::logic::{ClaimHolder, DriftReport, ToolError};
+pub use self::logic::{
+    ApproveOutcome, ClaimHolder, DriftReport, SetGateOutcome, ToolError,
+};
 pub use self::wire::{
-    BacklogArgs, BacklogResult, BacklogRowWire, BoardArgs, BoardResult,
-    BoardRowWire, CiConclusionWire, ClaimHolderWire, ClaimWire,
-    DriftFindingWire, DriftResult, IssueArgs, IssueResult, IssueStateWire,
+    ApproveArgs, ApproveDecisionWire, ApproveResult, BacklogArgs,
+    BacklogResult, BacklogRowWire, BoardArgs, BoardResult, BoardRowWire,
+    CiConclusionWire, ClaimHolderWire, ClaimWire, DriftFindingWire,
+    DriftResult, GateModeWire, IssueArgs, IssueResult, IssueStateWire,
     PriorityWire, PullRequestStateWire, PullRequestStatusWire, RegisterArgs,
-    RegisterResult, RelationshipsWire,
+    RegisterResult, RelationshipsWire, SetGateArgs, SetGateResult,
 };
 
 /// The HTTP path the MCP endpoint is mounted at.
@@ -373,6 +424,45 @@ impl SpecFlowServer {
         self.drift_inner().await.map(Json).map_err(tool_error)
     }
 
+    /// `approve(issue_number, phase, decision, note?)` (§6, §2.3b) —
+    /// grant or deny a `human` gate, writing the decision through to
+    /// GitHub before returning (§15).
+    ///
+    /// A **denial records the decision and does not route the phase
+    /// back** to the re-entry §6 defines for it; the re-entry is named
+    /// in the result and in the posted comment. See this module's doc,
+    /// and `logic`'s `approve_issue`, for why.
+    #[tool(description = "Grant or deny a phase's human gate on one \
+                       issue. `grant` writes the phase's approval \
+                       label; `deny` writes no label and records the \
+                       decision, the note, and the workflow's defined \
+                       re-entry as an issue comment — it does NOT \
+                       re-run that re-entry. Both are written to \
+                       GitHub before this returns.")]
+    pub async fn approve(
+        &self,
+        Parameters(args): Parameters<ApproveArgs>,
+    ) -> Result<Json<ApproveResult>, ErrorData> {
+        self.approve_inner(args).await.map(Json).map_err(tool_error)
+    }
+
+    /// `set_gate(issue_number, phase, mode)` (§6, §4.3) — set one
+    /// phase's gate for one issue by adding/removing its
+    /// `gate:<phase>` label.
+    #[tool(description = "Set a phase's gate for one issue by adding or \
+                       removing its `gate:<phase>` label (§4.3's \
+                       per-issue override of the workflow's default). \
+                       `human` adds the label; `none` and `auto` both \
+                       remove it — the per-issue label cannot encode \
+                       three states, and the merge gate is never \
+                       implicitly auto.")]
+    pub async fn set_gate(
+        &self,
+        Parameters(args): Parameters<SetGateArgs>,
+    ) -> Result<Json<SetGateResult>, ErrorData> {
+        self.set_gate_inner(args).await.map(Json).map_err(tool_error)
+    }
+
     // -- tool bodies, split out so the `?` operator is usable and the
     //    error mapping happens in exactly one place per tool --
 
@@ -565,6 +655,65 @@ impl SpecFlowServer {
         ))
     }
 
+    async fn approve_inner(
+        &self,
+        args: ApproveArgs,
+    ) -> Result<ApproveResult, ToolError> {
+        let bound = self.bound_project()?;
+        let vcs = Arc::clone(&self.shared.vcs);
+
+        // The same read-the-binding-once discipline the read tools
+        // use, and it matters more here: the write below goes to
+        // `for_task`'s repo, so reporting a project re-read afterwards
+        // could label a GitHub write with a repo it never touched.
+        let for_task = bound.clone();
+        let decision = args.decision.into();
+        let outcome = blocking(move || {
+            logic::approve_issue(
+                vcs.as_ref(),
+                &for_task.config,
+                args.issue_number,
+                &args.phase,
+                decision,
+                args.note.as_deref(),
+            )
+        })
+        .await?;
+
+        Ok(ApproveResult::from_outcome(
+            &outcome,
+            &bound.name,
+            &bound.config.repo,
+        ))
+    }
+
+    async fn set_gate_inner(
+        &self,
+        args: SetGateArgs,
+    ) -> Result<SetGateResult, ToolError> {
+        let bound = self.bound_project()?;
+        let vcs = Arc::clone(&self.shared.vcs);
+
+        let for_task = bound.clone();
+        let mode = args.mode.into();
+        let outcome = blocking(move || {
+            logic::set_gate_for_issue(
+                vcs.as_ref(),
+                &for_task.config,
+                args.issue_number,
+                &args.phase,
+                mode,
+            )
+        })
+        .await?;
+
+        Ok(SetGateResult::from_outcome(
+            &outcome,
+            &bound.name,
+            &bound.config.repo,
+        ))
+    }
+
     /// This connection's bound project, or [`ToolError::NotRegistered`].
     fn bound_project(&self) -> Result<BoundProject, ToolError> {
         self.lock_bound().clone().ok_or(ToolError::NotRegistered)
@@ -655,7 +804,13 @@ fn tool_error(error: ToolError) -> ErrorData {
         | ToolError::UnregisteredDirectory { .. }
         | ToolError::SpawnTokenUnsupported
         | ToolError::BoardFilterUnsupported
-        | ToolError::BacklogFilterUnsupported => {
+        | ToolError::BacklogFilterUnsupported
+        // A phase the workflow does not define is the *call's* mistake,
+        // not the machine's -- the file parsed, and its message lists
+        // the ids that would have worked. Deliberately not grouped with
+        // `ReadWorkflow`/`Workflow` below, which are about that same
+        // file being unusable.
+        | ToolError::UnknownPhase { .. } => {
             ErrorData::invalid_params(message, None)
         }
         ToolError::NotRegistered | ToolError::AlreadyBound { .. } => {
@@ -805,6 +960,16 @@ mod tests {
             (ToolError::SpawnTokenUnsupported, "invalid_params"),
             (ToolError::BoardFilterUnsupported, "invalid_params"),
             (ToolError::BacklogFilterUnsupported, "invalid_params"),
+            (
+                ToolError::UnknownPhase {
+                    phase: "merge".to_string(),
+                    known: vec![
+                        "product-spec".to_string(),
+                        "review".to_string(),
+                    ],
+                },
+                "invalid_params",
+            ),
             (ToolError::NotRegistered, "invalid_request"),
             (
                 ToolError::AlreadyBound {

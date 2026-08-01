@@ -30,8 +30,9 @@ use crate::vcs::{
     CiConclusion, IssueRelationships, IssueState, PullRequestState,
     PullRequestStatus,
 };
+use crate::workflow::{ApproveDecision, GateMode};
 
-use super::logic::{ClaimHolder, DriftReport};
+use super::logic::{ApproveOutcome, ClaimHolder, DriftReport, SetGateOutcome};
 
 // ---------------------------------------------------------------------
 // register (§6 "Registration & lifecycle")
@@ -419,6 +420,156 @@ pub struct ClaimHolderWire {
 }
 
 // ---------------------------------------------------------------------
+// approve / set_gate (§6 "Approval & gates", §2.3b, §4.3)
+// ---------------------------------------------------------------------
+
+/// Arguments to `approve(issue_number, phase, decision, note?)` (§6).
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+pub struct ApproveArgs {
+    /// The issue number, within the connection's bound project's repo
+    /// (§15 — see [`IssueArgs::number`] for why there is no `project`
+    /// argument). Named `issue_number` because §6 names it that in this
+    /// tool's signature.
+    pub issue_number: u64,
+
+    /// The phase whose gate is being decided — a [`crate::Phase`] id
+    /// from the project's own `.spec-flow/workflow.yaml` (§7.0), e.g.
+    /// `architecture`. Not the approval label's suffix: the shipped
+    /// default's merge gate is the phase `review`, whose approval label
+    /// is `approved:merge`. A phase the workflow does not define is
+    /// rejected with the list of ids it does.
+    pub phase: String,
+
+    /// Grant or deny.
+    pub decision: ApproveDecisionWire,
+
+    /// A free-text note recorded with the decision (§6 records it for a
+    /// denial in particular). Posted on the issue as part of the
+    /// comment this call leaves, so it is durable and visible to every
+    /// other instance (§2.3), not just to this connection.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Grant or deny, on the wire — the wire form of
+/// [`crate::ApproveDecision`].
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApproveDecisionWire {
+    /// Approve the gate: the phase's approval label is written.
+    Grant,
+    /// Refuse the gate: no approval label is written, and the decision
+    /// (with its note) is recorded as a comment. See
+    /// [`ApproveResult::reentry_triggered`].
+    Deny,
+}
+
+/// What `approve` did, and the issue's state afterwards (§6).
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+pub struct ApproveResult {
+    /// The decision, echoed back.
+    pub decision: ApproveDecisionWire,
+
+    /// The phase id as the workflow spells it.
+    pub phase: String,
+
+    /// The approval label written, when one was. `null` for a denial,
+    /// and for a grant on a phase that declares no `approval_label` at
+    /// all — in which case the comment this call posted is the only
+    /// record, and this field being `null` is how a client can tell.
+    pub approval_label: Option<String>,
+
+    /// For a denial: the re-entry this workflow defines for the phase
+    /// (§6's product-spec→re-groom / architecture→re-propose /
+    /// test-plan→re-plan / merge→address), named so a coordinator can
+    /// say what still has to happen. `null` for a grant, and for a
+    /// denial on a phase whose workflow defines no re-entry.
+    pub reentry: Option<String>,
+
+    /// Whether the daemon actually re-ran or spawned that re-entry.
+    ///
+    /// **Always `false`.** §6's deny contract has two halves — record
+    /// the state + note, and route the phase back — and this server
+    /// implements the first only: routing means spawning an agent or
+    /// re-running a phase, and no phase engine or spawner runs
+    /// alongside it (see `src/server/mod.rs`'s module doc). Reported as
+    /// a field rather than left to be inferred, so a client cannot read
+    /// a populated `reentry` as "the workflow has moved on" (§15's
+    /// "surface, don't bury").
+    pub reentry_triggered: bool,
+
+    /// The issue, re-read from GitHub after the write — the same shape
+    /// `issue(number)` returns, so a client renders it with the same
+    /// code. A re-read, not an assumption about what the write
+    /// produced (§2.3).
+    pub issue: IssueResult,
+}
+
+/// Arguments to `set_gate(issue_number, phase, mode)` (§6, §4.3).
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetGateArgs {
+    /// The issue number, within the connection's bound project's repo.
+    pub issue_number: u64,
+
+    /// The phase whose gate is being set — a [`crate::Phase`] id from
+    /// the project's `.spec-flow/workflow.yaml`, exactly as
+    /// [`ApproveArgs::phase`].
+    pub phase: String,
+
+    /// The gate mode to set for this issue.
+    pub mode: GateModeWire,
+}
+
+/// A phase's gate mode on the wire (§2.3b) — the wire form of
+/// [`crate::GateMode`].
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GateModeWire {
+    /// No approval; the phase advances automatically.
+    None,
+    /// The server requests approval and waits (§2.3b).
+    Human,
+    /// The gate is auto-approved.
+    Auto,
+}
+
+/// What `set_gate` did, and the issue's state afterwards (§6, §4.3).
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+pub struct SetGateResult {
+    /// The phase id as the workflow spells it.
+    pub phase: String,
+
+    /// The mode requested, echoed back.
+    pub mode: GateModeWire,
+
+    /// The `gate:<phase>` label this call wrote (§4.3).
+    pub label: String,
+
+    /// Whether that label is now present (`human`) or absent (`none`
+    /// and `auto` alike). Both permissive modes produce the *same*
+    /// absent-label state: the per-issue label scheme is one binary
+    /// marker and cannot encode three, so this field reports what was
+    /// actually written rather than implying the mode is separately
+    /// recorded — see [`crate::set_gate`] for the full reasoning, and
+    /// for why the merge gate cannot be silently opened this way.
+    pub label_present: bool,
+
+    /// What this phase's gate **actually evaluates to** right now,
+    /// after this write — not always the same as `mode`. A merge-gate
+    /// phase configured `human` by default ignores a `mode: auto`
+    /// request's label removal and stays `human` (§4.3's "merge is
+    /// special — never implicit auto"); this field is how a client
+    /// tells that apart from `mode`/`label_present` alone, rather than
+    /// believing a merge gate opened when it did not (§15's "surface,
+    /// don't bury"). See `logic`'s `set_gate_for_issue` doc.
+    pub effective_mode: GateModeWire,
+
+    /// The issue, re-read from GitHub after the write — the same shape
+    /// `issue(number)` returns.
+    pub issue: IssueResult,
+}
+
+// ---------------------------------------------------------------------
 // Shared leaf shapes
 // ---------------------------------------------------------------------
 
@@ -666,6 +817,98 @@ impl From<&ClaimHolder> for ClaimHolderWire {
             instance: holder.claim.instance.clone(),
             epoch: holder.claim.epoch,
             stale: holder.stale,
+        }
+    }
+}
+
+impl From<ApproveDecisionWire> for ApproveDecision {
+    fn from(decision: ApproveDecisionWire) -> ApproveDecision {
+        match decision {
+            ApproveDecisionWire::Grant => ApproveDecision::Grant,
+            ApproveDecisionWire::Deny => ApproveDecision::Deny,
+        }
+    }
+}
+
+impl From<ApproveDecision> for ApproveDecisionWire {
+    fn from(decision: ApproveDecision) -> ApproveDecisionWire {
+        match decision {
+            ApproveDecision::Grant => ApproveDecisionWire::Grant,
+            ApproveDecision::Deny => ApproveDecisionWire::Deny,
+        }
+    }
+}
+
+impl From<GateModeWire> for GateMode {
+    fn from(mode: GateModeWire) -> GateMode {
+        match mode {
+            GateModeWire::None => GateMode::None,
+            GateModeWire::Human => GateMode::Human,
+            GateModeWire::Auto => GateMode::Auto,
+        }
+    }
+}
+
+impl From<GateMode> for GateModeWire {
+    fn from(mode: GateMode) -> GateModeWire {
+        match mode {
+            GateMode::None => GateModeWire::None,
+            GateMode::Human => GateModeWire::Human,
+            GateMode::Auto => GateModeWire::Auto,
+        }
+    }
+}
+
+impl ApproveResult {
+    /// Project an [`ApproveOutcome`] onto the wire, tagging its issue
+    /// with the connection's bound project (§2.5).
+    ///
+    /// `reentry_triggered` is written as a literal `false` here rather
+    /// than read off the outcome: nothing in this crate can set it
+    /// true, and a field that could only ever be copied from a
+    /// hard-coded `false` on the domain type would just move the same
+    /// claim one layer down. See its own doc.
+    pub fn from_outcome(
+        outcome: &ApproveOutcome,
+        project: &str,
+        repo: &str,
+    ) -> ApproveResult {
+        ApproveResult {
+            decision: outcome.decision.into(),
+            phase: outcome.phase.clone(),
+            approval_label: outcome.approval_label.clone(),
+            reentry: outcome.reentry.clone(),
+            reentry_triggered: false,
+            issue: IssueResult::from_snapshot(
+                &outcome.snapshot,
+                project,
+                repo,
+                outcome.url.clone(),
+            ),
+        }
+    }
+}
+
+impl SetGateResult {
+    /// Project a [`SetGateOutcome`] onto the wire, tagging its issue
+    /// with the connection's bound project (§2.5).
+    pub fn from_outcome(
+        outcome: &SetGateOutcome,
+        project: &str,
+        repo: &str,
+    ) -> SetGateResult {
+        SetGateResult {
+            phase: outcome.phase.clone(),
+            mode: outcome.mode.into(),
+            label: outcome.label.label.clone(),
+            label_present: outcome.label.present,
+            effective_mode: outcome.effective_mode.into(),
+            issue: IssueResult::from_snapshot(
+                &outcome.snapshot,
+                project,
+                repo,
+                outcome.url.clone(),
+            ),
         }
     }
 }

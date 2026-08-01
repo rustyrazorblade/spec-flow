@@ -56,15 +56,19 @@ const READY_STATUS: &str = "ready";
 /// guessed at with a broader match that has no real case to justify it
 /// yet.
 ///
-/// `pub(super)` today since only this module's own `advance`/
-/// `advance_into` call it; the still-nonexistent phase engine that will
-/// actually execute `merge_queue` (§14 step 7+) will need the same
-/// check too, but widening this function's visibility can wait until
-/// that caller exists. When it does, `crate::merge`'s `plan_merge`/
-/// `observe_merge` (§14 step 8) are the pure decision functions that
-/// pick up once this identifies `review` as the phase to run them
-/// against.
-pub(super) fn is_merge_gate(phase: &Phase) -> bool {
+/// `pub(crate)`, not `pub`: this module's own `advance`/`advance_into`
+/// were its only callers until `crate::server::logic`'s `approve` tool
+/// needed the same structural definition to recognize §6's
+/// `merge→address` denial routing (a denied *merge* gate re-enters the
+/// `address` out-of-band phase, every other gated phase re-runs itself)
+/// — so the definition is shared rather than restated there. It stays
+/// crate-internal because nothing outside this crate has a [`Phase`] to
+/// ask about. The still-nonexistent phase engine that will actually
+/// execute `merge_queue` (§14 step 7+) needs this same check; when it
+/// exists, `crate::merge`'s `plan_merge`/`observe_merge` (§14 step 8)
+/// are the pure decision functions that pick up once this identifies
+/// `review` as the phase to run them against.
+pub(crate) fn is_merge_gate(phase: &Phase) -> bool {
     matches!(&phase.action, PhaseAction::Server { op } if op == "merge_queue")
 }
 
@@ -529,32 +533,34 @@ pub struct LabelOp {
 /// nothing to grant, so this returns an empty list rather than
 /// fabricating a label name.
 ///
-/// **Deny is only partially modeled.** §6 describes it as recording the
-/// state and note, then routing the phase back to its defined re-entry
+/// **Deny writes no label at all, and that is the whole of what this
+/// function decides for it.** §6 describes deny as recording the state
+/// and note, then routing the phase back to its defined re-entry
 /// (product-spec→re-groom, architecture→re-propose, test-plan→re-plan,
-/// merge→address). This function returns an empty `Vec` for `Deny`: it
-/// correctly computes "no approval label is written," but does **not**
-/// compute the re-entry, and — per §15's "every state-changing call
-/// writes through to GitHub" — writes no GitHub-visible trace of the
-/// denial at all (no comment, no label another instance could observe).
-/// Two different reasons this isn't done here rather than one:
+/// merge→address). This function returns an empty `Vec` for `Deny`,
+/// which is the correct label decision — a denial writes no
+/// `approved:<phase>` — and computes nothing else: the re-entry needs
+/// the [`super::WorkflowConfig`] `out_of_band` lives on, which this
+/// function does not take.
 ///
-/// - For `merge→address`, the re-entry target IS already derivable
-///   today, from [`super::OutOfBandPhase::reenters`] on the `address`
-///   out-of-band entry — this function's earlier revision claimed
-///   otherwise, which was wrong.
-/// - For `product-spec`/`architecture`/`test-plan`, denying just means
-///   "re-run this same phase" (§6's "re-groom"/"re-propose"/"re-plan" are
-///   all self-re-entries), which needs no routing table at all — only a
-///   decision about *what* to write (a comment with the note? clearing
-///   the status label back to the same phase, which is already a no-op
-///   for status but not for any note/history?).
+/// The rest of §6's deny contract is split between a caller and a
+/// still-missing engine, and the split is deliberate:
 ///
-/// What actually blocks implementing this is that `approve` takes only a
-/// `&Phase`, not the `WorkflowConfig` `out_of_band` lives on, and no
-/// caller exists yet (§14 step 7 stops short of the MCP tool wiring) to
-/// pin down what "recording the note" should look like in this crate's
-/// terms. Recorded here rather than guessed at.
+/// - **Recording the denial + note is done**, by
+///   `crate::server::logic`'s `approve` tool: it posts a GitHub comment
+///   carrying the decision, the note, and the re-entry this workflow
+///   defines for the phase (§15's "every state-changing MCP call writes
+///   through to GitHub before returning" — a denial that lived only in
+///   one instance's memory would be invisible to every other).
+/// - **Routing the phase back is not.** For `merge→address` the target
+///   is derivable ([`super::OutOfBandPhase::reenters`] names the phase
+///   the `address` entry returns to), and for `product-spec`/
+///   `architecture`/`test-plan` §6's "re-groom"/"re-propose"/"re-plan"
+///   are self-re-entries needing no routing table at all — but
+///   *triggering* either means spawning an agent or re-running a phase,
+///   and no phase engine or spawner runs alongside the MCP server (see
+///   `crate::server`'s module doc). The name is reported; the re-entry
+///   is not fired.
 pub fn approve(phase: &Phase, decision: ApproveDecision) -> Vec<LabelOp> {
     match decision {
         ApproveDecision::Grant => match &phase.approval_label {

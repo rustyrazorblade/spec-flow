@@ -1,7 +1,7 @@
 //! The MCP tools' bodies, as ordinary synchronous functions over the
 //! [`Vcs`] seam — everything about §6's `register`/`board`/`issue`/
-//! `backlog`/`drift` that can be decided or fetched without an async
-//! runtime or an HTTP connection in scope.
+//! `backlog`/`drift`/`approve`/`set_gate` that can be decided or
+//! fetched without an async runtime or an HTTP connection in scope.
 //!
 //! This is the split §5 asks for ("everything but the `git`/`gh` layer
 //! and the process spawner is unit-testable by stubbing those seams")
@@ -30,7 +30,10 @@ use crate::state::drift::{
 };
 use crate::state::{Claim, IssueSnapshot, read_issue_state};
 use crate::vcs::{IssueRelationships, IssueState, Vcs, VcsError};
-use crate::workflow::{WorkflowConfig, WorkflowError, parse_workflow};
+use crate::workflow::{
+    ApproveDecision, GateMode, LabelOp, Phase, PhaseAction, WorkflowConfig,
+    WorkflowError, effective_gate_mode, is_merge_gate, parse_workflow,
+};
 
 /// Errors an MCP tool call can fail with (§6).
 ///
@@ -124,6 +127,30 @@ pub enum ToolError {
          filter to get every not-yet-ready issue"
     )]
     BacklogFilterUnsupported,
+
+    /// `approve`/`set_gate` named a `phase` the project's effective
+    /// workflow does not define (§7.0, §11.3).
+    ///
+    /// The caller's mistake, not the machine's: the workflow file
+    /// parsed fine (a file that did not would have failed as
+    /// [`ToolError::Workflow`] before this check ran), and the phase
+    /// vocabulary a client may name is exactly the `phases:` list that
+    /// file declares. The known ids are listed in the message rather
+    /// than left for the client to discover, since a team edits that
+    /// list (§7.0) and a hard-coded guess at it is exactly what would
+    /// go stale.
+    #[error(
+        "no phase {phase} in this project's .spec-flow/workflow.yaml; \
+         it defines: {}",
+        known.join(", ")
+    )]
+    UnknownPhase {
+        /// The phase id the client asked for.
+        phase: String,
+        /// Every phase id the project's workflow actually defines, in
+        /// pipeline order.
+        known: Vec<String>,
+    },
 
     /// The project's committed `.spec-flow/workflow.yaml` could not be
     /// read. Distinct from [`ToolError::Config`], which is about the
@@ -648,6 +675,412 @@ fn dependency_states<V: Vcs>(
     }
 
     states
+}
+
+// ---------------------------------------------------------------------
+// The write path (§6 "Approval & gates", §2.3b, §4.3)
+// ---------------------------------------------------------------------
+
+/// What an `approve` call actually did (§6) — the write it performed,
+/// plus the issue re-read from GitHub afterwards.
+///
+/// The snapshot is a **re-read**, not the caller's assumption about
+/// what the write produced: §2.3's "re-derive from GitHub" and §15's
+/// "every state-changing MCP call writes through to GitHub before
+/// returning" together mean the honest answer to "what is this issue's
+/// state now" is the one GitHub gives back, which also folds in
+/// anything another instance changed in between.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApproveOutcome {
+    /// The decision as recorded.
+    pub decision: ApproveDecision,
+    /// The phase id, as the workflow spells it (echoed from the matched
+    /// [`Phase`], not from the client's argument).
+    pub phase: String,
+    /// The approval label written, for a `grant` on a phase that
+    /// declares one. `None` for every `deny`, and for a `grant` on a
+    /// phase with no `approval_label` at all (see
+    /// [`crate::workflow::approve`]).
+    pub approval_label: Option<String>,
+    /// For a `deny`: the re-entry this workflow defines for the phase
+    /// (§6), as named in the posted comment. `None` when the workflow
+    /// defines none — see this module's `denial_reentry` for how it is
+    /// derived and when it is absent. Always `None` for a `grant`,
+    /// which routes nowhere.
+    pub reentry: Option<String>,
+    /// The issue, re-read from GitHub after the write.
+    pub snapshot: IssueSnapshot,
+    /// That issue's GitHub URL (§15).
+    pub url: String,
+}
+
+/// What a `set_gate` call actually did (§6, §4.3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetGateOutcome {
+    /// The phase id, as the workflow spells it.
+    pub phase: String,
+    /// The mode requested. Note [`GateMode::None`] and
+    /// [`GateMode::Auto`] produce the *same* label operation — see
+    /// [`crate::workflow::set_gate`] for why the per-issue label scheme
+    /// cannot distinguish them.
+    pub mode: GateMode,
+    /// The label operation performed.
+    pub label: LabelOp,
+    /// What this phase's gate **actually evaluates to** right now —
+    /// [`crate::workflow::effective_gate_mode`] applied to the phase's
+    /// own configured default, the label just written, and whether this
+    /// is the merge gate. Requesting `mode` and getting `effective_mode`
+    /// back are not always the same value: `mode: Auto` on a phase whose
+    /// configured default is `human` **and** which is the merge gate
+    /// still evaluates to `Human` (§4.3's "merge is special — never
+    /// implicit auto"), so a client that only read `mode`/`label_present`
+    /// back could believe a merge gate is open when it is not. This
+    /// field exists so that can never happen silently (§15's "surface,
+    /// don't bury") — see `set_gate_for_issue`'s doc.
+    pub effective_mode: GateMode,
+    /// The issue, re-read from GitHub after the write.
+    pub snapshot: IssueSnapshot,
+    /// That issue's GitHub URL (§15).
+    pub url: String,
+}
+
+/// Find the phase `phase_id` names in the project's effective workflow.
+///
+/// The lookup is by [`Phase::id`] — the id §4.3's `gate:<phase>` labels
+/// and §7.1's `requires: ["approved:<phase>"]` entries are written in,
+/// which is not always the same string as the phase's approval label
+/// (the shipped default's merge gate is `id: review` with
+/// `approval_label: "approved:merge"`). A client naming `merge` there
+/// is therefore told the phase does not exist, with the real id list in
+/// the message; guessing that `merge` meant `review` would be this
+/// crate inventing an alias the workflow file does not declare.
+fn find_phase<'w>(
+    workflow: &'w WorkflowConfig,
+    phase_id: &str,
+) -> Result<&'w Phase, ToolError> {
+    workflow.phases.iter().find(|phase| phase.id == phase_id).ok_or_else(
+        || ToolError::UnknownPhase {
+            phase: phase_id.to_string(),
+            known: workflow
+                .phases
+                .iter()
+                .map(|phase| phase.id.clone())
+                .collect(),
+        },
+    )
+}
+
+/// The re-entry §6 defines for a **denied** gate on `phase` — the name
+/// the denial comment reports, not something this crate triggers.
+///
+/// §6 names four cases (product-spec→re-groom, architecture→re-propose,
+/// test-plan→re-plan, merge→address). Those are read here structurally,
+/// from the workflow's own shape, rather than as a hard-coded table of
+/// those four ids — a phase list is team-editable (§7.0), so a table
+/// keyed on the shipped default's ids would answer wrongly for any
+/// other pipeline:
+///
+/// - The **merge gate** ([`is_merge_gate`] — the phase whose action
+///   enqueues the merge, `review` in the shipped default) re-enters the
+///   out-of-band phase that declares it re-enters back, i.e. the entry
+///   whose [`crate::workflow::OutOfBandPhase::reenters`] is this
+///   phase's id. In the shipped default that is exactly `address`
+///   (`{id: address, action: {type: agent, role: developer}, reenters:
+///   review}`), which is §6's `merge→address`.
+/// - An **agent phase** ([`PhaseAction::Agent`], which is what
+///   product-spec/architecture/test-plan are) re-enters *itself*:
+///   §6's "re-groom"/"re-propose"/"re-plan" all mean running that same
+///   phase again, so the name reported is the phase's own id.
+/// - **Anything else** — a `Server` phase that is not the merge gate,
+///   or a `ServerThenAgent` phase — gets `None`. §6 defines no re-entry
+///   for a mechanical server step, and re-running one is not what its
+///   re-entry words describe; reporting a re-entry there would be this
+///   function asserting something the spec does not say. The denial is
+///   still recorded (see [`approve_issue`]): losing an operator's
+///   decision because the workflow has nowhere to route it would be the
+///   worse failure. `approve_issue` places no precondition on the
+///   phase's own gate mode (see its "No precondition check" section),
+///   so this branch is reachable even on the shipped default by
+///   denying an ungated phase like `finalize` directly — not just from
+///   a team-edited config that puts a `human` gate on one; it is
+///   answered rather than asserted impossible either way.
+///
+/// A workflow declaring **more than one** out-of-band entry re-entering
+/// the merge gate resolves to the first in declaration order, and the
+/// ambiguity is not reported: §6 describes one re-entry per phase, and
+/// failing a recorded human decision over a config quirk would be the
+/// wrong trade. The shipped default declares one entry per re-entered
+/// phase.
+fn denial_reentry<'w>(
+    workflow: &'w WorkflowConfig,
+    phase: &'w Phase,
+) -> Option<&'w str> {
+    if is_merge_gate(phase) {
+        return workflow
+            .out_of_band
+            .iter()
+            .find(|entry| entry.reenters == phase.id)
+            .map(|entry| entry.id.as_str());
+    }
+    match phase.action {
+        PhaseAction::Agent { .. } => Some(phase.id.as_str()),
+        _ => None,
+    }
+}
+
+/// The comment a **granted** gate leaves on the issue (§2.3b, §15).
+///
+/// Posted even when a label was written, and *especially* when one was
+/// not: §2.3b makes the approval label and this MCP call two surfaces
+/// of the same decision, and a phase with no `approval_label`
+/// configured has no label surface at all — for it this comment is the
+/// only durable record that a human said yes (§2.3's "all durable state
+/// lives in GitHub").
+fn approval_granted_comment(
+    phase_id: &str,
+    approval_label: Option<&str>,
+    note: Option<&str>,
+) -> String {
+    let mut body = format!(
+        "**Gate approved — `{phase_id}`** (via the `approve` MCP tool, \
+         §2.3b/§6).\n\n"
+    );
+    match approval_label {
+        Some(label) => body.push_str(&format!(
+            "The `{label}` label is now on this issue; that label is the \
+             durable record every instance reads.\n"
+        )),
+        None => body.push_str(
+            "This phase declares no approval label, so no label was \
+             written — this comment is the only record of the \
+             decision.\n",
+        ),
+    }
+    if let Some(note) = note {
+        body.push_str(&format!("\nNote: {note}\n"));
+    }
+    body
+}
+
+/// The comment a **denied** gate leaves on the issue — §6's "records
+/// the state + note" half, in full, and an explicit statement that its
+/// "routes the phase back" half did not happen.
+///
+/// The last paragraph is not boilerplate: an operator who denies a gate
+/// and is told nothing would reasonably assume the workflow moved on by
+/// itself. It did not, and nothing else in this system would tell them
+/// so (§15's "surface, don't bury").
+fn approval_denied_comment(
+    phase_id: &str,
+    reentry: Option<&str>,
+    note: Option<&str>,
+) -> String {
+    let mut body = format!(
+        "**Gate denied — `{phase_id}`** (via the `approve` MCP tool, \
+         §2.3b/§6). No approval label was written.\n\n"
+    );
+    if let Some(note) = note {
+        body.push_str(&format!("Note: {note}\n\n"));
+    }
+    match reentry {
+        Some(reentry) if reentry == phase_id => body.push_str(&format!(
+            "Re-entry: this workflow re-enters `{reentry}` — the same \
+             phase, run again.\n\n"
+        )),
+        Some(reentry) => body.push_str(&format!(
+            "Re-entry: this workflow re-enters `{reentry}`.\n\n"
+        )),
+        None => body.push_str(
+            "Re-entry: this workflow defines none for this phase, so \
+             there is nothing to route back to.\n\n",
+        ),
+    }
+    body.push_str(
+        "spec-flow recorded this denial and did **not** re-run that \
+         re-entry or spawn an agent for it — no phase engine runs \
+         alongside the daemon yet. Trigger it yourself.",
+    );
+    body
+}
+
+/// `approve(issue_number, phase, decision, note?)` (§6) — grant or deny
+/// a `human` gate over MCP, writing the decision through to GitHub
+/// before returning (§15).
+///
+/// The order is §6's own: the label first ("both write the
+/// corresponding GitHub label as their first act, so every instance
+/// sees the decision"), then the comment, then a re-read of the issue.
+/// A grant that writes its label and then fails to post its comment
+/// therefore leaves the *authoritative* half done — the label is what
+/// [`crate::workflow::gate_clear`] actually consults — and reports the
+/// failure; the reverse order would report a failure having recorded
+/// nothing that unblocks the pipeline.
+///
+/// # No precondition check that the gate is actually pending
+///
+/// §6 calls this "the alternative to applying the approval label by
+/// hand", and §2.3b makes the two surfaces equal ("whichever comes
+/// first advances; the other is reconciled"). Applying the label by
+/// hand is checked by nothing, so a *stricter* MCP path — refusing to
+/// record an approval for a phase whose effective gate is not `human`
+/// right now, or that the issue has already passed — would make the two
+/// surfaces disagree about what an operator is allowed to say. Granting
+/// twice is idempotent **for the label** (the same label, already
+/// present); granting early records an approval the gate will find
+/// waiting for it, exactly as a hand-applied label would. The posted
+/// comment is not idempotent the same way — a retried grant leaves a
+/// second "Gate approved" comment, since each call's durable record is
+/// exactly what happened on that call, not a diff against the last one.
+///
+/// # What is deliberately not done for `deny`
+///
+/// §6's deny "records the state + note **and routes the phase back to
+/// its defined re-entry**". This closes the first half and explicitly
+/// not the second: the comment names the re-entry
+/// ([`denial_reentry`]), and nothing re-runs it. Routing means spawning
+/// an agent (for the merge gate's `address`, an agent phase per §7.2)
+/// or re-running a content phase, and no phase engine or spawner runs
+/// alongside this server — the same boundary `super`'s module doc draws
+/// for `next_assignment`. [`ApproveOutcome::reentry`] carries the name
+/// so a coordinator can say what still has to happen; it is not a claim
+/// that it happened.
+///
+/// # Cost
+///
+/// One or two `gh` invocations for the write — always one `gh issue
+/// comment`, plus one `gh issue edit` when a grant has a label to write
+/// — then [`read_issue_state`]'s usual three-to-four for the re-read
+/// (see [`read_board`]'s "Cost" section for what those are), plus one
+/// local file read for the workflow config ([`load_workflow`]). Unlike
+/// `board`/`backlog`/`drift`, this is a single-issue call, so there is
+/// no fan-out over the open-issue list — a reasoned count, not a
+/// measured one, unlike theirs.
+pub fn approve_issue<V: Vcs>(
+    vcs: &V,
+    project: &ProjectConfig,
+    issue_number: u64,
+    phase_id: &str,
+    decision: ApproveDecision,
+    note: Option<&str>,
+) -> Result<ApproveOutcome, ToolError> {
+    let workflow = load_workflow(project)?;
+    let phase = find_phase(&workflow, phase_id)?;
+
+    // `approve` returns at most one op today (a grant's approval
+    // label); applying all of them keeps this correct if it ever
+    // returns more, while `approval_label` below reports the first —
+    // the one §6 names.
+    let ops = crate::workflow::approve(phase, decision);
+    for op in &ops {
+        vcs.set_label(&project.repo, issue_number, &op.label, op.present)?;
+    }
+
+    let reentry = match decision {
+        ApproveDecision::Grant => None,
+        ApproveDecision::Deny => {
+            denial_reentry(&workflow, phase).map(str::to_string)
+        }
+    };
+    let comment = match decision {
+        ApproveDecision::Grant => approval_granted_comment(
+            &phase.id,
+            ops.first().map(|op| op.label.as_str()),
+            note,
+        ),
+        ApproveDecision::Deny => {
+            approval_denied_comment(&phase.id, reentry.as_deref(), note)
+        }
+    };
+    vcs.post_comment(&project.repo, issue_number, &comment)?;
+
+    let (snapshot, url) = read_issue(vcs, project, issue_number)?;
+    Ok(ApproveOutcome {
+        decision,
+        phase: phase.id.clone(),
+        approval_label: ops.first().map(|op| op.label.clone()),
+        reentry,
+        snapshot,
+        url,
+    })
+}
+
+/// `set_gate(issue_number, phase, mode)` (§6, §4.3) — set one phase's
+/// gate for one issue by adding or removing its `gate:<phase>` label,
+/// then re-read the issue.
+///
+/// The label *is* the state (§4.3: "`set_gate` (MCP) and the label are
+/// the same thing on two surfaces"), so this writes exactly the one
+/// operation [`crate::workflow::set_gate`] computes and nothing else.
+///
+/// # Two things this deliberately does not do
+///
+/// - **No comment.** Unlike [`approve_issue`], which records a human
+///   *decision* that a bare label cannot always carry (a phase with no
+///   approval label has no label surface at all, and a denial has no
+///   label by definition), every `set_gate` call is fully expressed by
+///   the label it writes. Adding a comment per call would put unasked-
+///   for noise on the issue for a state §6 already calls "the MCP
+///   surface of that label".
+/// - **Nothing distinguishes an explicit `auto` from an untouched
+///   phase.** [`GateMode::None`] and [`GateMode::Auto`] both remove the
+///   label, so §15's "a **recorded** `auto` choice" is not recorded
+///   *as* a choice — `crate::workflow::gate`'s module doc and
+///   [`crate::workflow::set_gate`]'s already record this from the read
+///   and decision sides, and this tool inherits it rather than
+///   inventing a marker label the rest of the crate would not read.
+///   The one case where it would be unsafe is carved out already: the
+///   merge gate never *falls back* to `auto` from a `human` default off
+///   an absent label ([`crate::workflow::effective_gate_mode`], §4.3's
+///   "merge is special"). A merge-gate phase whose *configured* default
+///   is already `auto` still resolves to `auto` with the label absent —
+///   that is §15's "recorded `auto` choice" living in the config
+///   instead of a per-issue label, not the silent-permissive case this
+///   carve-out guards against.
+///
+/// # A label that does not exist in the repo
+///
+/// Adding `gate:<phase>` needs that label to already exist
+/// ([`Vcs::set_label`]'s doc). `spec-flow init` provisions every
+/// `gate:<phase.id>` the workflow declares
+/// ([`crate::workflow::label_vocabulary`]), so this succeeds for any
+/// project whose workflow has not gained a phase since its last `init`
+/// — the already-recorded gap in that provisioning, not a new one. The
+/// same `gh` name-to-GraphQL-id resolution `Vcs::set_label`'s doc
+/// describes for `--add-label` applies to `--remove-label` too (both
+/// resolve the label's id before mutating), so `GateMode::None`/`Auto`
+/// on a phase whose `gate:<phase>` label was never created inherits
+/// this exact dependency, not just `GateMode::Human`'s add.
+pub fn set_gate_for_issue<V: Vcs>(
+    vcs: &V,
+    project: &ProjectConfig,
+    issue_number: u64,
+    phase_id: &str,
+    mode: GateMode,
+) -> Result<SetGateOutcome, ToolError> {
+    let workflow = load_workflow(project)?;
+    let phase = find_phase(&workflow, phase_id)?;
+
+    let label = crate::workflow::set_gate(phase, mode);
+    vcs.set_label(&project.repo, issue_number, &label.label, label.present)?;
+
+    // `mode`/`label.present` alone cannot answer "is this gate actually
+    // human right now" for the one case §4.3 singles out: a merge-gate
+    // phase configured `human` by default ignores `mode: auto`'s label
+    // removal and stays `Human` (see `SetGateOutcome::effective_mode`'s
+    // doc) -- computed from the same three inputs `effective_gate_mode`
+    // always takes, not re-derived ad hoc.
+    let effective_mode =
+        effective_gate_mode(phase.gate, label.present, is_merge_gate(phase));
+
+    let (snapshot, url) = read_issue(vcs, project, issue_number)?;
+    Ok(SetGateOutcome {
+        phase: phase.id.clone(),
+        mode,
+        label,
+        effective_mode,
+        snapshot,
+        url,
+    })
 }
 
 #[cfg(test)]
@@ -1489,5 +1922,459 @@ mod tests {
         let (snapshot, _) = read_issue(&vcs, &project, issue.number).unwrap();
 
         assert_eq!(snapshot.state, IssueState::Closed);
+    }
+
+    // -- approve / set_gate --
+
+    const REPO: &str = "owner/repo-a";
+
+    /// One open issue (number 1) in the fake's `REPO`, plus a project
+    /// whose primary checkout carries the shipped default workflow.
+    fn issue_and_project(dir: &Path) -> (FakeVcs, ProjectConfig) {
+        let vcs = FakeVcs::new();
+        vcs.create_issue(REPO, "Widget cache", "").unwrap();
+        (vcs, project_with_workflow(dir))
+    }
+
+    /// Every comment posted on issue 1 of `REPO`.
+    fn comments(vcs: &FakeVcs) -> Vec<String> {
+        vcs.comments
+            .borrow()
+            .get(&(REPO.to_string(), 1))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Issue 1's raw labels.
+    fn labels(vcs: &FakeVcs) -> Vec<String> {
+        vcs.issues.borrow()[&(REPO.to_string(), 1)].labels.clone()
+    }
+
+    #[test]
+    fn approve_grant_writes_the_approval_label_and_returns_fresh_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        let outcome = approve_issue(
+            &vcs,
+            &project,
+            1,
+            "product-spec",
+            ApproveDecision::Grant,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.approval_label.as_deref(),
+            Some("approved:product-spec")
+        );
+        assert!(labels(&vcs).contains(&"approved:product-spec".to_string()));
+        // The returned state is re-read from GitHub, not assumed (§2.3).
+        assert_eq!(outcome.snapshot.approvals, vec!["product-spec"]);
+        assert_eq!(outcome.url, "https://github.com/owner/repo-a/issues/1");
+        assert!(outcome.reentry.is_none(), "a grant routes nowhere");
+    }
+
+    #[test]
+    fn approve_grant_leaves_a_comment_naming_the_label_it_wrote() {
+        // §2.3b's dual surface: an operator watching the issue in
+        // GitHub sees why the label appeared, not just that it did.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        approve_issue(
+            &vcs,
+            &project,
+            1,
+            "architecture",
+            ApproveDecision::Grant,
+            Some("looks right"),
+        )
+        .unwrap();
+
+        let comments = comments(&vcs);
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].contains("Gate approved"));
+        assert!(comments[0].contains("approved:architecture"));
+        assert!(comments[0].contains("looks right"));
+    }
+
+    #[test]
+    fn approve_grant_on_a_phase_with_no_approval_label_records_it_anyway() {
+        // `conflict-check` declares no `approval_label` at all, so
+        // `workflow::approve` has no label to write -- and the comment
+        // is then the ONLY durable record of the decision.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        let outcome = approve_issue(
+            &vcs,
+            &project,
+            1,
+            "conflict-check",
+            ApproveDecision::Grant,
+            None,
+        )
+        .unwrap();
+
+        assert!(outcome.approval_label.is_none());
+        assert!(labels(&vcs).is_empty(), "{:?}", labels(&vcs));
+        assert_eq!(comments(&vcs).len(), 1);
+        assert!(comments(&vcs)[0].contains("no approval label"));
+    }
+
+    #[test]
+    fn approve_grant_twice_leaves_one_approval() {
+        // The idempotent retry §2.3b's two surfaces make ordinary: a
+        // hand-applied label followed by an `approve` call, or simply a
+        // client retrying.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        for _ in 0..2 {
+            approve_issue(
+                &vcs,
+                &project,
+                1,
+                "test-plan",
+                ApproveDecision::Grant,
+                None,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            labels(&vcs),
+            vec!["approved:test-plan".to_string()],
+            "the label set must not grow on a retry"
+        );
+    }
+
+    #[test]
+    fn approve_deny_writes_no_label_and_names_the_self_reentry() {
+        // §6's architecture→re-propose: denying an agent phase means
+        // running that same phase again.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        let outcome = approve_issue(
+            &vcs,
+            &project,
+            1,
+            "architecture",
+            ApproveDecision::Deny,
+            None,
+        )
+        .unwrap();
+
+        assert!(outcome.approval_label.is_none());
+        assert!(labels(&vcs).is_empty(), "a denial writes no label");
+        assert_eq!(outcome.reentry.as_deref(), Some("architecture"));
+        assert!(outcome.snapshot.approvals.is_empty());
+
+        let comments = comments(&vcs);
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].contains("Gate denied"));
+        assert!(comments[0].contains("re-enters `architecture`"));
+        assert!(comments[0].contains("the same phase, run again"));
+        // The half §6 asks for that this does NOT do, stated on the
+        // issue itself rather than only in a doc comment.
+        assert!(comments[0].contains("did **not** re-run"));
+    }
+
+    #[test]
+    fn approve_deny_records_the_note_on_the_issue() {
+        // §6's "deny records the state + note" -- and it has to be
+        // durable, since another instance reads only GitHub (§2.3).
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        approve_issue(
+            &vcs,
+            &project,
+            1,
+            "product-spec",
+            ApproveDecision::Deny,
+            Some("the acceptance criteria contradict issue #7"),
+        )
+        .unwrap();
+
+        assert!(
+            comments(&vcs)[0]
+                .contains("the acceptance criteria contradict issue #7")
+        );
+    }
+
+    #[test]
+    fn approve_deny_on_the_merge_gate_names_the_address_reentry() {
+        // §6's merge→address, derived structurally rather than from a
+        // table of phase ids: the shipped default's merge gate is the
+        // phase `review` (`{type: server, op: merge_queue}`), and
+        // `address` is the out-of-band entry declaring `reenters:
+        // review`.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        let outcome = approve_issue(
+            &vcs,
+            &project,
+            1,
+            "review",
+            ApproveDecision::Deny,
+            Some("two unresolved review threads"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.reentry.as_deref(), Some("address"));
+        assert!(comments(&vcs)[0].contains("re-enters `address`"));
+        assert!(labels(&vcs).is_empty());
+
+        // The wire contract, not just the domain type: a client reading
+        // a populated `reentry` alongside `reentry_triggered` must never
+        // see `true` -- that would be this server claiming it fired an
+        // agent it cannot spawn. Checked on this exact case (a populated
+        // `reentry`) because that is the one a bug could plausibly flip.
+        let wire = super::super::wire::ApproveResult::from_outcome(
+            &outcome, "proj-a", REPO,
+        );
+        assert!(!wire.reentry_triggered);
+        assert_eq!(wire.reentry.as_deref(), Some("address"));
+    }
+
+    #[test]
+    fn approve_deny_on_a_non_merge_server_phase_names_no_reentry() {
+        // `finalize` is `{type: server, op: finalize}` -- not the merge
+        // gate, not an agent phase. §6 defines no re-entry for it, and
+        // this reports none rather than inventing "re-run it".
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        let outcome = approve_issue(
+            &vcs,
+            &project,
+            1,
+            "finalize",
+            ApproveDecision::Deny,
+            None,
+        )
+        .unwrap();
+
+        assert!(outcome.reentry.is_none());
+        // The decision is still recorded: losing it because the
+        // workflow has nowhere to route would be the worse failure.
+        assert_eq!(comments(&vcs).len(), 1);
+        assert!(comments(&vcs)[0].contains("defines none"));
+    }
+
+    #[test]
+    fn approve_deny_on_a_merge_gate_with_no_out_of_band_entry_reports_none() {
+        // The other way to reach "no defined re-entry": a team-edited
+        // workflow whose merge gate has no out-of-band phase re-entering
+        // it. The shipped default cannot produce this.
+        let tmp = tempfile::tempdir().unwrap();
+        let vcs = FakeVcs::new();
+        vcs.create_issue(REPO, "Widget cache", "").unwrap();
+        let project = project_config("a", REPO, tmp.path());
+        let path = workflow_path(&project);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "\
+labels:
+  priority: [P0]
+  status: [review]
+  gate_prefix: \"gate:\"
+  approval_prefix: \"approved:\"
+  owner_prefix: \"owner:\"
+spec: {tool: openspec, optional: true, skip_label: \"spec:skip\"}
+review_panel: []
+fix_loop: {max_rounds: 1, on_exhausted: escalate, on_decision_finding: escalate}
+phases:
+  - {id: review, action: {type: server, op: merge_queue}, gate: human, approval_label: \"approved:merge\", status_label: review}
+",
+        )
+        .unwrap();
+
+        let outcome = approve_issue(
+            &vcs,
+            &project,
+            1,
+            "review",
+            ApproveDecision::Deny,
+            None,
+        )
+        .unwrap();
+
+        assert!(outcome.reentry.is_none());
+        assert!(comments(&vcs)[0].contains("defines none"));
+    }
+
+    #[test]
+    fn approve_rejects_a_phase_the_workflow_does_not_define() {
+        // `merge` is the approval *label*'s suffix, not a phase id --
+        // the shipped default's merge gate is the phase `review`. The
+        // rejection lists the ids that would have worked.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        let error = approve_issue(
+            &vcs,
+            &project,
+            1,
+            "merge",
+            ApproveDecision::Grant,
+            None,
+        )
+        .unwrap_err();
+
+        match &error {
+            ToolError::UnknownPhase { phase, known } => {
+                assert_eq!(phase, "merge");
+                assert!(known.contains(&"review".to_string()));
+            }
+            other => panic!("expected UnknownPhase, got {other:?}"),
+        }
+        // The argument is validated before anything is written: a
+        // rejected call must leave no half-applied trace on the issue.
+        assert!(labels(&vcs).is_empty());
+        assert!(comments(&vcs).is_empty());
+    }
+
+    #[test]
+    fn approve_reports_a_project_with_no_workflow_file() {
+        // Same stance as `read_backlog`: the phase vocabulary is
+        // *defined* by this file (§7.0), so a missing one fails loudly
+        // rather than falling back to the shipped default.
+        let tmp = tempfile::tempdir().unwrap();
+        let vcs = FakeVcs::new();
+        vcs.create_issue(REPO, "Widget cache", "").unwrap();
+        let project = project_config("a", REPO, tmp.path());
+
+        assert!(matches!(
+            approve_issue(
+                &vcs,
+                &project,
+                1,
+                "product-spec",
+                ApproveDecision::Grant,
+                None
+            ),
+            Err(ToolError::ReadWorkflow { .. })
+        ));
+    }
+
+    #[test]
+    fn set_gate_human_adds_the_per_issue_gate_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        let outcome = set_gate_for_issue(
+            &vcs,
+            &project,
+            1,
+            "architecture",
+            GateMode::Human,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.label.label, "gate:architecture");
+        assert!(outcome.label.present);
+        assert_eq!(outcome.snapshot.gates, vec!["architecture"]);
+        assert!(comments(&vcs).is_empty(), "set_gate posts no comment");
+    }
+
+    #[test]
+    fn set_gate_auto_removes_the_gate_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        vcs.set_label(REPO, 1, "gate:architecture", true).unwrap();
+
+        let outcome = set_gate_for_issue(
+            &vcs,
+            &project,
+            1,
+            "architecture",
+            GateMode::Auto,
+        )
+        .unwrap();
+
+        assert!(!outcome.label.present);
+        assert!(outcome.snapshot.gates.is_empty());
+        assert_eq!(outcome.effective_mode, GateMode::Auto);
+    }
+
+    #[test]
+    fn set_gate_auto_on_the_merge_gate_removes_the_label_but_stays_human() {
+        // §4.3's "merge is special": the shipped default's merge gate
+        // (`review`) is configured `gate: human`, so removing
+        // `gate:review` does NOT open it -- `effective_gate_mode` falls
+        // back to `Human`, not `Auto`, off an absent label for this one
+        // phase. `mode`/`label_present` alone would tell a client the
+        // opposite of what is actually true; `effective_mode` exists so
+        // that divergence is never silent.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        vcs.set_label(REPO, 1, "gate:review", true).unwrap();
+
+        let outcome =
+            set_gate_for_issue(&vcs, &project, 1, "review", GateMode::Auto)
+                .unwrap();
+
+        assert!(!outcome.label.present, "the label removal did happen");
+        assert_eq!(
+            outcome.effective_mode,
+            GateMode::Human,
+            "but the merge gate must not silently read as open"
+        );
+    }
+
+    #[test]
+    fn set_gate_none_removes_the_same_label_auto_does() {
+        // The collapse `workflow::set_gate` documents: one binary label
+        // cannot encode three modes, so `none` and `auto` are the same
+        // write. Pinned here so the wire result's `label_present` can
+        // never start implying otherwise.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        vcs.set_label(REPO, 1, "gate:architecture", true).unwrap();
+
+        let outcome = set_gate_for_issue(
+            &vcs,
+            &project,
+            1,
+            "architecture",
+            GateMode::None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.label.label, "gate:architecture");
+        assert!(!outcome.label.present);
+        assert!(outcome.snapshot.gates.is_empty());
+    }
+
+    #[test]
+    fn set_gate_is_idempotent_when_the_label_already_reflects_the_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        for _ in 0..2 {
+            set_gate_for_issue(&vcs, &project, 1, "review", GateMode::Human)
+                .unwrap();
+        }
+
+        assert_eq!(labels(&vcs), vec!["gate:review".to_string()]);
+    }
+
+    #[test]
+    fn set_gate_rejects_a_phase_the_workflow_does_not_define() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        assert!(matches!(
+            set_gate_for_issue(&vcs, &project, 1, "deploy", GateMode::Human),
+            Err(ToolError::UnknownPhase { .. })
+        ));
+        assert!(labels(&vcs).is_empty());
     }
 }
