@@ -43,9 +43,11 @@ pub enum ScaffoldError {
 /// The default `.spec-flow/workflow.yaml`, verbatim from spec §11.3.
 ///
 /// Kept as text rather than built from serde types on purpose: the
-/// comments are half the value of the file a team is meant to edit, and
-/// this crate has no workflow data model yet (the phase engine, §14 step
-/// 7, introduces one).
+/// comments are half the value of the file a team is meant to edit.
+/// [`crate::workflow`] (§14 step 7) does now parse this text into typed
+/// shapes — see [`crate::workflow::parse_workflow`] — but this constant
+/// stays the hand-authored source of truth either way; nothing
+/// serializes a [`crate::workflow::WorkflowConfig`] back into it.
 pub(crate) const DEFAULT_WORKFLOW_YAML: &str = r#"labels:
   priority: [P0, P1, P2, P3]
   status:   [product-spec, conflict-check, architecture, test-plan, ready, implement, review, done]

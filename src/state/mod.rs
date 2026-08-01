@@ -55,7 +55,12 @@ const GATE_PREFIX: &str = "gate:";
 
 /// The `approved:<phase>` label prefix (§4.3, §11.3
 /// `labels.approval_prefix`).
-const APPROVAL_PREFIX: &str = "approved:";
+///
+/// `pub(crate)` — see [`STATUS_PREFIX`]; [`crate::workflow::advance`]
+/// reuses this same prefix to derive the approval-label suffix a
+/// phase's `approval_label` actually names, rather than assuming it
+/// always equals the phase's `id`.
+pub(crate) const APPROVAL_PREFIX: &str = "approved:";
 
 /// The `owner:<instance>@<epoch>` label prefix (§8.2, §11.3
 /// `labels.owner_prefix`).
