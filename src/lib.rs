@@ -40,6 +40,7 @@ callers write `spec_flow::GlobalConfig`, not
 | `workflow/` | The workflow-config data model + parser (§7, §14 step 7): [`workflow::WorkflowConfig`] and its nested types, deserialized straight from `scaffold::DEFAULT_WORKFLOW_YAML`; gate evaluation ([`workflow::gate_clear`] and friends, §2.3b/§4.3); `requires` evaluation ([`workflow::requirement_satisfied`], §7.1); the review-panel/bounded-fix-loop decision primitive ([`workflow::evaluate_panel`], §7.1); and `advance`/`approve`/`set_gate` as plain, pure functions (§6) | Implemented (step 7) as pure data + pure functions only — see the module's own doc for exactly what is and is not covered; no phase engine, spawner wiring, or MCP server calls any of it yet. Step 9 added [`workflow::label_vocabulary`] (every GitHub label name the config actually uses), consumed by `init`. |
 | `merge.rs` | Merge-queue integration (§8.1, §14 step 8): [`merge::plan_merge`] (gate → enqueue, native mode) and [`merge::observe_merge`] (observe) as pure functions | Implemented (step 8) for the **native** merge queue only — see the module's own doc for why the serialized fallback (§8.1's warn-and-degrade path) is a documented, deliberately unresolved gap rather than a guess: it hinges on §8.3's lease model, itself an open question (§16 item 5). `init`'s merge-queue-enabled check (this step's other named deliverable) was already implemented in step 1 (`init::detect_merge_mode`); nothing changed there. |
 | `implement.rs` | `start_implement` kickoff (§10.2, §14 step 9): [`start_implement_setup`] (claim the worktree, read the issue, decide spec-author-vs-skip) and [`finish_implement_setup`] (commit the spec if one was authored, push, post the dev plan) as two `Vcs`-touching orchestration functions | Implemented (step 9) for the mechanics either side of the spawned spec-authoring agent §10.2 places between them — the actual spawn is a future step's job (no spawner wiring exists yet). Does not itself claim the issue; that's `crate::claim`'s job, called before this module. |
+| `board.rs` | Board rendering (§13, §14 step 9): [`build_board`], a pure aggregation of [`IssueSnapshot`]s into [`BoardRow`]s, and [`issue_url`] (deterministically derived, no `Vcs` round trip) | Implemented (step 9) for every column derivable from GitHub state alone (phase, owner, gates/approvals, PR signals) — see the module's own doc for why the **worktree** and per-agent columns §13 also names are deliberately absent: that data lives in `spawner::ProcessSpawner`'s in-memory map, which nothing in this crate runs alongside the GitHub-state layer yet. |
 | `main.rs` (binary, not part of this library) | `clap` CLI wiring, `tracing` setup, `anyhow` error reporting at the top level | `init` is fully wired (step 1); the `serve` subcommand (the MCP server itself) is a stub — out of scope until spec §14 step 6+. |
 
 # What is deliberately *not* here yet
@@ -50,19 +51,19 @@ work-claiming and the scheduler's ordering, the instruction composer's
 pure mechanism, the workflow-config parser plus the phase engine's pure
 decision logic, and native merge-queue integration) plus the step-2
 spike recorded in `docs/memory-index-spike.md` (no code needed there),
-and **two slices of step 9** so far: label-vocabulary provisioning
-(`init` now creates every `status:`/`gate:`/`approved:`/`spec:skip`
-label a project's workflow declares, via the new [`Vcs::ensure_label`]
-and [`workflow::label_vocabulary`]) — this only runs when `init` itself
-runs, so a team that edits `workflow.yaml` *after* `init` and never
-re-runs it still hits the same "label doesn't exist" failure for
-whatever it added (see `provision_label_vocabulary`'s doc) — and
-`start_implement`'s worktree/spec-authoring kickoff mechanics
-(`implement.rs`). Step 9's remaining named deliverables — `board`/report
-aggregation (§13), and the `link`/`unlink` write side of `conflict-check`'s
-proposed dependency edges (§8.4) — remain unbuilt. `link`/`unlink`
-specifically need resolving an issue number to its GraphQL node ID
-first (confirmed via live `gh api graphql` schema introspection:
+and **step 9, minus one deliberately deferred piece**: label-vocabulary
+provisioning (`init` now creates every `status:`/`gate:`/`approved:`/
+`spec:skip` label a project's workflow declares, via [`Vcs::
+ensure_label`] and [`workflow::label_vocabulary`]) — this only runs
+when `init` itself runs, so a team that edits `workflow.yaml` *after*
+`init` and never re-runs it still hits the same "label doesn't exist"
+failure for whatever it added (see `provision_label_vocabulary`'s doc)
+— `start_implement`'s worktree/spec-authoring kickoff mechanics
+(`implement.rs`), [`Vcs::create_issue`], and board rendering
+(`board.rs`). The one deliberately unbuilt piece is the `link`/`unlink`
+write side of `conflict-check`'s proposed dependency edges (§8.4):
+those need resolving an issue number to its GraphQL node ID first
+(confirmed via live `gh api graphql` schema introspection:
 `addBlockedBy`/`removeBlockedBy`/`addSubIssue`/`removeSubIssue` all take
 `ID!` arguments, not issue numbers) plus a decision about what happens
 on orgs with native issue dependencies switched off (`read_relationships`
@@ -95,6 +96,7 @@ built, the official Rust SDK is
 */
 #![deny(missing_docs)]
 
+pub use crate::board::{BoardRow, build_board, issue_url};
 pub use crate::claim::{ClaimError, ClaimResult, confirm_claim, write_claim};
 pub use crate::config::{
     Binaries, ClaimConfig, ConfigError, GhConfig, GlobalConfig, HarnessConfig,
@@ -153,6 +155,7 @@ pub use crate::workflow::{
     requirement_satisfied, set_gate,
 };
 
+mod board;
 mod claim;
 mod config;
 mod implement;
