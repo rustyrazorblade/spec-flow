@@ -27,9 +27,9 @@ callers write `spec_flow::GlobalConfig`, not
 
 | File | Owns | Status (§14) |
 |---|---|---|
-| `config.rs` | [`GlobalConfig`]/[`ProjectConfig`] shapes, their file paths, load/save | Implemented (step 1). `instance_id` auto-generation on first `serve` is still open — `serve` itself doesn't exist yet. |
+| `config.rs` | [`GlobalConfig`]/[`ProjectConfig`] shapes, their file paths, load/save | Implemented (step 1). `instance_id` auto-generation on first `serve` is **still open** — `serve` now exists (see `server/`) but is read-only, so nothing in it writes a claim label that would need an instance id; generating and persisting one as a side effect of a read-only daemon was deliberately not done. |
 | `registry.rs` | Idempotent add/list/find over the global config's `projects` list | Implemented (step 1). |
-| `vcs/` | The [`Vcs`] trait (the git/gh subprocess seam), [`ShellVcs`] (real), [`FakeVcs`] (test double) | Fully implemented (step 1) — no `todo!()`s remain in `vcs/shell.rs`. `vcs/mod.rs`'s trait signatures are load-bearing for both implementations and every call site; change them and every caller together. Step 4 added two methods for PR/CI/merge-queue signals: [`Vcs::find_linked_pull_requests`], [`Vcs::read_pull_request_status`]. Step 9 added [`Vcs::ensure_label`] (create a label if absent) to close a real gap: `set_label` cannot add a label that doesn't already exist in the repo, which blocked every fixed-vocabulary `status:`/`gate:`/`approved:` label, not only `claim.rs`'s already-documented per-heartbeat one; and [`Vcs::create_issue`] (§7.2 ph.1's "the server creates the GitHub issue" mechanic, e.g. for `groom`), which reads the freshly created issue back by number rather than parsing anything beyond that number out of `gh issue create`'s URL output, mirroring [`Vcs::open_pr`]'s "create, then view by a stable key" split. |
+| `vcs/` | The [`Vcs`] trait (the git/gh subprocess seam), [`ShellVcs`] (real), [`FakeVcs`] (test double) | Fully implemented (step 1) — no `todo!()`s remain in `vcs/shell.rs`. `vcs/mod.rs`'s trait signatures are load-bearing for both implementations and every call site; change them and every caller together. Step 4 added two methods for PR/CI/merge-queue signals: [`Vcs::find_linked_pull_requests`], [`Vcs::read_pull_request_status`]. Step 9 added [`Vcs::ensure_label`] (create a label if absent) to close a real gap: `set_label` cannot add a label that doesn't already exist in the repo, which blocked every fixed-vocabulary `status:`/`gate:`/`approved:` label, not only `claim.rs`'s already-documented per-heartbeat one; and [`Vcs::create_issue`] (§7.2 ph.1's "the server creates the GitHub issue" mechanic, e.g. for `groom`), which reads the freshly created issue back by number rather than parsing anything beyond that number out of `gh issue create`'s URL output, mirroring [`Vcs::open_pr`]'s "create, then view by a stable key" split. Step 11 (the MCP server) added [`Vcs::list_open_issues`], closing a gap nothing had hit before: every read path built to that point started from an issue number a caller already had, so §6/§13's `board` — which takes no issue argument — could not name its own rows. See that method's doc for its scope (numbers only, open only) and why it does not return richer rows. |
 | `state/` | The GitHub-state layer (§4.2, §14 step 4): [`IssueSnapshot`] (derived per-issue state), the pure [`state::derive_issue_state`] label-parsing function, the [`state::read_issue_state`] orchestrator, and drift detection (see [`DriftFinding`]) | Implemented (step 4) for what is derivable from GitHub state alone — dependency cycles, closed/missing dependencies, stale claims, a merged PR against a still-open issue, an issue carrying more than one `status:`/`owner:` label, and an issue with more than one simultaneously **open** linked PR. Deliberately does **not** cover the drift kinds needing the phase engine's or worktree manager's own bookkeeping (a status label disagreeing with reality, an orphaned worktree, an implemented branch with no PR) — those are a later step's job (§14 steps 5/7). |
 | `init.rs` | The `spec-flow init` business logic ([`init`]) | Implemented (step 1): composes `config`, `registry`, `scaffold`, and an injected [`Vcs`]. Step 9 added label-vocabulary provisioning: after scaffolding, `init` reads the repo's *effective* `.spec-flow/workflow.yaml` back off disk (a team's hand-edit, not always the compiled-in default), derives every label name [`crate::workflow::label_vocabulary`] returns, and calls [`Vcs::ensure_label`] for each — closing the gap `vcs/`'s row above describes. |
 | `scaffold.rs` | The committed `.spec-flow/` files `init` materializes: the default `workflow.yaml` (§11.3) and one `instructions/<point>.md` per injection point (§9.1) | Implemented (step 1). Base-template content (§14 step 6 Deliverable B) is **partial**: `groom` and `implement` now hold real, substantive templates distilled from this plugin's `product-manager`/`groom` and `tdd-developer`/`implement` agent/skill content; the remaining 17 injection points still hold the original thin placeholder — authoring those is unfinished work, not done here. |
@@ -40,8 +40,9 @@ callers write `spec_flow::GlobalConfig`, not
 | `workflow/` | The workflow-config data model + parser (§7, §14 step 7): [`workflow::WorkflowConfig`] and its nested types, deserialized straight from `scaffold::DEFAULT_WORKFLOW_YAML`; gate evaluation ([`workflow::gate_clear`] and friends, §2.3b/§4.3); `requires` evaluation ([`workflow::requirement_satisfied`], §7.1); the review-panel/bounded-fix-loop decision primitive ([`workflow::evaluate_panel`], §7.1); and `advance`/`approve`/`set_gate` as plain, pure functions (§6) | Implemented (step 7) as pure data + pure functions only — see the module's own doc for exactly what is and is not covered; no phase engine, spawner wiring, or MCP server calls any of it yet. Step 9 added [`workflow::label_vocabulary`] (every GitHub label name the config actually uses), consumed by `init`. |
 | `merge.rs` | Merge-queue integration (§8.1, §14 step 8): [`merge::plan_merge`] (gate → enqueue, native mode) and [`merge::observe_merge`] (observe) as pure functions | Implemented (step 8) for the **native** merge queue only — see the module's own doc for why the serialized fallback (§8.1's warn-and-degrade path) is a documented, deliberately unresolved gap rather than a guess: it hinges on §8.3's lease model, itself an open question (§16 item 5). `init`'s merge-queue-enabled check (this step's other named deliverable) was already implemented in step 1 (`init::detect_merge_mode`); nothing changed there. |
 | `implement.rs` | `start_implement` kickoff (§10.2, §14 step 9): [`start_implement_setup`] (claim the worktree, read the issue, decide spec-author-vs-skip) and [`finish_implement_setup`] (commit the spec if one was authored, push, post the dev plan) as two `Vcs`-touching orchestration functions | Implemented (step 9) for the mechanics either side of the spawned spec-authoring agent §10.2 places between them — the actual spawn is a future step's job (no spawner wiring exists yet). Does not itself claim the issue; that's `crate::claim`'s job, called before this module. |
-| `board.rs` | Board rendering (§13, §14 step 9): [`build_board`], a pure aggregation of [`IssueSnapshot`]s into [`BoardRow`]s, and [`issue_url`] (deterministically derived, no `Vcs` round trip) | Implemented (step 9) for every column derivable from GitHub state alone (phase, owner, gates/approvals, PR signals) — see the module's own doc for why the **worktree** and per-agent columns §13 also names are deliberately absent: that data lives in `spawner::ProcessSpawner`'s in-memory map, which nothing in this crate runs alongside the GitHub-state layer yet. |
-| `main.rs` (binary, not part of this library) | `clap` CLI wiring, `tracing` setup, `anyhow` error reporting at the top level | `init` is fully wired (step 1); the `serve` subcommand (the MCP server itself) is a stub — out of scope until spec §14 step 6+. |
+| `board.rs` | Board rendering (§13, §14 step 9): [`build_board`], a pure aggregation of [`IssueSnapshot`]s into [`BoardRow`]s, and [`issue_url`] (deterministically derived, no `Vcs` round trip) | Implemented (step 9) for every column derivable from GitHub state alone (phase, owner, gates/approvals, PR signals) — see the module's own doc for why the **worktree** and per-agent columns §13 also names are deliberately absent: that data lives in `spawner::ProcessSpawner`'s in-memory map, which nothing in this crate runs alongside the GitHub-state layer yet. Step 11 gave it its first caller: `server/`'s `board` MCP tool. |
+| `server/` | The MCP daemon itself (§2.5, §5, §6, §14): [`serve`] (bind loopback, serve MCP over streamable HTTP/SSE until Ctrl-C), [`mcp_service`] (the `tower` service, split out so tests mount it on an ephemeral port), [`SpecFlowServer`] (one `rmcp` handler instance per connection, holding that connection's bound project), the `*Wire`/`*Args`/`*Result` MCP wire shapes, and [`ToolError`] | Implemented (step 11, the first slice of §6) for **three read-only tools only** — `register` (coordinator path: resolve `cwd` to a registered project and bind the connection to it for life, §2.5/§15), `board` (§13, every open issue through [`crate::state::read_issue_state`] into [`build_board`]), and `issue`. This is where `tokio` and `rmcp` enter the crate. Read the module's own doc before extending it: it records the **confirmed** `rmcp`/MCP constraint the per-connection project binding rests on (protocol revision `2026-07-28` removes sessions, so the transport serves it statelessly with a fresh handler per request — this server therefore advertises only the session-bearing revisions), and lists every §6 tool deliberately absent, each with its reason. `board`'s `filter` argument and `register`'s `spawn_token` path are **rejected, not ignored**. |
+| `main.rs` (binary, not part of this library) | `clap` CLI wiring, `tracing` setup, `anyhow` error reporting at the top level | Both subcommands are wired: `init` (step 1) and `serve` (step 11 — loads the global config, builds the [`ShellVcs`] from §8.5's configured binary paths, and blocks on [`serve`] inside a runtime it builds itself rather than via `#[tokio::main]`, so `init` pays nothing for an async runtime it never uses). |
 
 # What is deliberately *not* here yet
 
@@ -51,9 +52,9 @@ GitHub-state layer, work-claiming and the scheduler's ordering, the
 instruction composer's pure mechanism, the workflow-config parser plus
 the phase engine's pure decision logic, native merge-queue integration,
 and cross-project scheduling fairness) plus the step-2 spike recorded
-in `docs/memory-index-spike.md` (no code needed there) — **minus two
-deliberately deferred pieces, both documented at their own module,
-neither guessed at**:
+in `docs/memory-index-spike.md` (no code needed there), plus the first
+slice of the MCP server itself (`server/`) — **minus three deliberately
+deferred pieces, each documented at its own module, none guessed at**:
 
 - Step 9's label-vocabulary provisioning (`init` now creates every
   `status:`/`gate:`/`approved:`/`spec:skip` label a project's workflow
@@ -87,10 +88,34 @@ neither guessed at**:
   boundary `board.rs`'s module doc already draws for the worktree/
   per-agent columns it likewise omits).
 
-It still has no async runtime, no MCP crate, and no actual phase engine
-wiring. In particular, step 5 stops short of an actual polling loop:
-the `schedule` module's doc records why a CI/PR poller's backoff timer
-is out of scope until an async runtime exists. Step 6 stops short of
+- `server/` ships **three of §6's ~24 MCP tools** — `register`
+  (coordinator path only), `board`, and `issue` — and nothing else. The
+  rest are *absent*, not stubbed, and enumerated one by one with their
+  reasons in that module's own doc; the two arguments it accepts but
+  refuses (`board`'s `filter`, `register`'s `spawn_token`) are rejected
+  rather than silently ignored, so no client can mistake an unfiltered
+  board or a coordinator binding for what it asked for. That doc also
+  records the one **confirmed** external constraint this design rests
+  on, read out of `rmcp` 3.1.0's own transport source rather than
+  assumed: MCP revision `2026-07-28` removes sessions, and the streamable
+  HTTP transport routes such a client statelessly (a fresh handler per
+  request) *before* consulting any handler — so §15's "a connection is
+  bound to exactly one project for its life" is unimplementable for it,
+  and this server advertises only the session-bearing revisions. It
+  also records a measured performance problem, not a theoretical one:
+  `board` re-reads every open issue from GitHub on every call, one `gh`
+  subprocess at a time — ~20s for a 16-issue repo, ~48 subprocesses —
+  because §2.3/§5's disposable local cache does not exist in this crate
+  yet and a batched GraphQL read would be a new `Vcs` method needing its
+  own live schema validation.
+
+The crate now has an async runtime and an MCP crate (`tokio` + `rmcp`,
+both entering at `server/`), but still no phase-engine wiring. In
+particular, step 5 stops short of an actual polling loop: the `schedule`
+module's doc records why a CI/PR poller's backoff timer is out of scope
+until something drives it — an async runtime now exists, but `serve` is
+purely request-driven and runs no background task at all. Step 6 stops
+short of
 authoring every injection point's real base-template content
 (`instructions.rs`'s and `scaffold.rs`'s docs record exactly which two
 points do, and which the rest still don't) and short of wiring the
@@ -101,10 +126,11 @@ computes what should happen next, never causes it to happen — see
 unmodeled `deny` re-entry routing and the not-yet-implemented
 `workflows:` map (§7.4's multiple-named-workflows extension point).
 Step 8 (`merge.rs`) stops short of the serialized merge-lease fallback —
-see that module's doc for exactly why. When the MCP server itself is
-built, the official Rust SDK is
-[`rmcp`](https://github.com/modelcontextprotocol/rust-sdk); pull it in
-(with `tokio`) at that point, not before.
+see that module's doc for exactly why. Nothing in `server/` calls
+`claim`, `schedule`, `workflow`, `merge`, `implement`, `instructions`, or
+`spawner` yet: the three tools it ships are read-only, so the modules
+that would need `claim.rs`'s still-unresolved `owner:` label conflict
+(see its row above) settled first are untouched by this slice.
 */
 #![deny(missing_docs)]
 
@@ -138,6 +164,13 @@ pub use crate::scaffold::ScaffoldError;
 pub use crate::schedule::{
     Candidate, DEFAULT_PHASE_ORDER, FairShareState, ProjectQueue,
     ScheduledIssue, next_action, next_action_across_projects, schedule_order,
+};
+pub use crate::server::{
+    BOARD_ISSUE_LIMIT, BoardArgs, BoardResult, BoardRowWire, CiConclusionWire,
+    ClaimWire, IssueArgs, IssueResult, IssueStateWire, MCP_PATH, PriorityWire,
+    PullRequestStateWire, PullRequestStatusWire, RegisterArgs, RegisterResult,
+    RelationshipsWire, ServeError, SpecFlowServer, ToolError, mcp_service,
+    serve,
 };
 pub use crate::spawner::{
     LocalProcessEntry, ProcessSpawner, SpawnError, SpawnKey, SpawnToken,
@@ -179,6 +212,7 @@ mod merge;
 mod registry;
 mod scaffold;
 mod schedule;
+mod server;
 mod spawner;
 mod state;
 mod vcs;

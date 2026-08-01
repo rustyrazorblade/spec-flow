@@ -343,6 +343,50 @@ pub trait Vcs {
         issue_number: u64,
     ) -> Result<IssueRef, VcsError>;
 
+    /// The numbers of `repo`'s **open** issues, newest first, capped at
+    /// `limit`.
+    ///
+    /// # Why this method exists (a gap found by the MCP server, §14 step
+    /// 11)
+    ///
+    /// Every read path built before this one started from an issue number
+    /// somebody already had: `read_issue`, `read_relationships`,
+    /// `find_linked_pull_requests`, `crate::state::read_issue_state`,
+    /// `crate::claim`, `crate::schedule` and `crate::board::build_board`
+    /// all take issue numbers (or already-built [`crate::IssueSnapshot`]s)
+    /// as *input*. Nothing in this trait could answer "which issues does
+    /// this repo have?", so §6/§13's `board` tool — "the orchestration
+    /// board (issues × phase × ...)", with no issue-number argument — had
+    /// no way to name its own rows. That is a real capability gap, not a
+    /// missing convenience: `build_board` was already written and tested,
+    /// and still could not be called against a live repo.
+    ///
+    /// # Scope, and what it deliberately does not do
+    ///
+    /// Numbers only, and open issues only — the minimum `board` needs to
+    /// then run each issue through [`crate::state::read_issue_state`]. It
+    /// deliberately does **not** return [`IssueRef`]s, even though the
+    /// underlying `gh` call could fetch titles/labels/state in the same
+    /// round trip: `read_issue_state` is keyed on issue *numbers* and
+    /// re-reads each issue anyway, so returning richer rows here would
+    /// create a second, subtly different path to the same facts without
+    /// removing a single call. It also does not expose `gh issue list`'s
+    /// `--state closed|all` or its label/assignee/search filters; §6's
+    /// `board(filter?)` argument is unimplemented (see
+    /// `src/server/mod.rs`), and adding filter parameters no caller
+    /// passes would be guessing at their shape.
+    ///
+    /// `limit` is required rather than defaulted because the underlying
+    /// `gh issue list` is itself capped (30 by default) — a caller must
+    /// state how much of a large backlog it is willing to page in, since
+    /// each returned number costs three or four further `gh` calls in
+    /// `read_issue_state`.
+    fn list_open_issues(
+        &self,
+        repo: &str,
+        limit: u32,
+    ) -> Result<Vec<u64>, VcsError>;
+
     /// Add (`present = true`) or remove (`present = false`) a label on
     /// an issue. A single boolean-setter method per the style guide's
     /// `yes: bool` convention, rather than two near-identical methods.

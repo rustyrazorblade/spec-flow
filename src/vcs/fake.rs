@@ -291,6 +291,31 @@ impl Vcs for FakeVcs {
         })
     }
 
+    /// Derived from [`issues`](FakeVcs::issues), not from a separate
+    /// seedable list: a fake that could report an issue number
+    /// [`Vcs::read_issue`] then fails on would let a caller pass tests
+    /// against a state real GitHub cannot produce. Sorted descending to
+    /// model `gh issue list`'s newest-first ordering — the real one sorts
+    /// by creation time, which this fake has no notion of, but issue
+    /// numbers are monotonic, so descending number is that same order.
+    fn list_open_issues(
+        &self,
+        repo: &str,
+        limit: u32,
+    ) -> Result<Vec<u64>, VcsError> {
+        let issues = self.issues.borrow();
+        let mut numbers: Vec<u64> = issues
+            .iter()
+            .filter(|((issue_repo, _), issue)| {
+                issue_repo == repo && issue.state == IssueState::Open
+            })
+            .map(|((_, number), _)| *number)
+            .collect();
+        numbers.sort_unstable_by(|a, b| b.cmp(a));
+        numbers.truncate(limit as usize);
+        Ok(numbers)
+    }
+
     /// Unlike `ShellVcs::set_label`, this fake always accepts a novel
     /// label name — it models the trait's stated contract, not the real
     /// `gh issue edit --add-label`'s "label must already exist"
@@ -579,6 +604,67 @@ mod tests {
             vcs.read_issue("owner/repo", 1),
             Err(VcsError::CommandFailed { .. })
         ));
+    }
+
+    #[test]
+    fn list_open_issues_is_empty_for_an_unseeded_repo() {
+        let vcs = FakeVcs::new();
+
+        assert!(vcs.list_open_issues("owner/repo", 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_open_issues_returns_open_issues_newest_first() {
+        let vcs = FakeVcs::new();
+        vcs.create_issue("owner/repo", "First", "a").unwrap();
+        vcs.create_issue("owner/repo", "Second", "b").unwrap();
+        vcs.create_issue("owner/repo", "Third", "c").unwrap();
+
+        assert_eq!(
+            vcs.list_open_issues("owner/repo", 100).unwrap(),
+            vec![3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn list_open_issues_omits_closed_issues() {
+        let vcs = FakeVcs::new();
+        vcs.create_issue("owner/repo", "Open one", "a").unwrap();
+        let closed =
+            vcs.create_issue("owner/repo", "Closed one", "b").unwrap();
+        vcs.issues
+            .borrow_mut()
+            .get_mut(&("owner/repo".to_string(), closed.number))
+            .unwrap()
+            .state = IssueState::Closed;
+
+        assert_eq!(vcs.list_open_issues("owner/repo", 100).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn list_open_issues_scopes_to_the_requested_repo() {
+        let vcs = FakeVcs::new();
+        vcs.create_issue("owner/repo-a", "On a", "").unwrap();
+        vcs.create_issue("owner/repo-b", "On b", "").unwrap();
+
+        assert_eq!(
+            vcs.list_open_issues("owner/repo-a", 100).unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            vcs.list_open_issues("owner/repo-b", 100).unwrap(),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn list_open_issues_truncates_to_the_limit_keeping_the_newest() {
+        let vcs = FakeVcs::new();
+        vcs.create_issue("owner/repo", "First", "").unwrap();
+        vcs.create_issue("owner/repo", "Second", "").unwrap();
+        vcs.create_issue("owner/repo", "Third", "").unwrap();
+
+        assert_eq!(vcs.list_open_issues("owner/repo", 2).unwrap(), vec![3, 2]);
     }
 
     #[test]

@@ -47,15 +47,57 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# The MCP server (§2.5, §5, §6, §14): the official Rust SDK
+# (https://github.com/modelcontextprotocol/rust-sdk). The `server` feature
+# (on by default) brings the `#[tool]`/`#[tool_router]`/`#[tool_handler]`
+# macro family plus the `ServerHandler` trait, and pulls in `schemars`,
+# which `rmcp` re-exports as `rmcp::schemars` — so tool argument/result
+# types derive `JsonSchema` without this crate pinning schemars itself and
+# risking a version split against the one the macros generate code for.
+# `transport-streamable-http-server` is §2.5/§14's "MCP over HTTP/SSE,
+# loopback only" surface; deliberately NOT `transport-io` (stdio), which
+# §14 rules out ("not stdio — many phase processes connect").
+rmcp = { version = "3.1", features = [
+  "server",
+  "transport-streamable-http-server",
+] }
+
+# `rmcp`'s streamable-HTTP server transport is a `tower::Service`, not a
+# listener — something must bind the socket and route to it. `axum` is what
+# `rmcp`'s own tests/examples use for exactly this, and with default
+# features off it is a thin layer over `hyper` (none of the ws/multipart/
+# macro machinery this crate would never call).
+axum = { version = "0.8", default-features = false, features = [
+  "http1",
+  "tokio",
+] }
+
+# The async runtime `rmcp` requires. Deliberately narrow feature set:
+# `rt-multi-thread` + `macros` for `#[tokio::main]`, `net` for the TCP
+# listener, `signal` for `serve`'s Ctrl-C graceful shutdown. `process` is
+# absent on purpose — `crate::vcs` keeps shelling out synchronously via
+# `std::process`, and `crate::server` runs those blocking calls on
+# `tokio::task::spawn_blocking` (part of `rt`) rather than rewriting the
+# git/gh layer async.
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "signal",
+] }
+
 [dev-dependencies]
 # `spec-flow init` writes real files (a project config, `.spec-flow/`
 # scaffolding); its tests run against a scratch directory rather than
 # the operator's home or a real checkout.
 tempfile = "3"
 
-# NOTE on MCP (later step, §14 steps 3+): this crate does not depend on an
-# MCP crate or an async runtime yet — step 1 is synchronous CLI scaffolding
-# (registry + git/gh layer + `spec-flow init`) only. When the phase engine /
-# process spawner / MCP server land, the official Rust SDK is `rmcp`
-# (https://github.com/modelcontextprotocol/rust-sdk); pull it in then,
-# alongside `tokio`, not before.
+# `tests/mcp_server.rs` stands the real server up on an ephemeral loopback
+# port and drives it with a real MCP client over HTTP, so the handshake /
+# session / tool-dispatch path is covered end to end instead of asserted
+# about. Client side only — never a runtime dependency.
+rmcp = { version = "3.1", features = [
+  "client",
+  "transport-streamable-http-client-reqwest",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

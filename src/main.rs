@@ -10,16 +10,22 @@
 //! (one binary, `serve` + `init`):
 //!
 //! - `spec-flow serve` — run the daemon (MCP over HTTP/SSE, loopback,
-//!   §2.5). **Not implemented yet** (§14 steps 2+); this only logs that
-//!   fact and exits.
+//!   §2.5). Wired to [`spec_flow::serve`]; see that module's docs for
+//!   which of §6's tools the server actually implements today.
 //! - `spec-flow init` — register the current repo with the daemon (§6,
 //!   §11). Wired to [`spec_flow::init`], which takes its
 //!   [`spec_flow::Vcs`] implementation as an argument; constructing the
 //!   real [`spec_flow::ShellVcs`] from the configured binary paths
 //!   (§8.5) is this binary's job.
+//!
+//! `main` is deliberately **not** `#[tokio::main]`: only `serve` needs
+//! an async runtime, and starting a multi-threaded one for every
+//! `spec-flow init` (a wholly synchronous command, §14 step 1) would be
+//! pure overhead. `serve` builds its own runtime instead.
 
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 /// A standalone, project-agnostic MCP daemon for AI-agent software
@@ -34,8 +40,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the daemon (MCP over HTTP/SSE, loopback). Not implemented
-    /// yet.
+    /// Run the daemon (MCP over HTTP/SSE, loopback).
     Serve(ServeArgs),
 
     /// Register this repo with the daemon and scaffold its
@@ -72,11 +77,35 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve(_args) => {
-            // Task #14 steps 2+: the process spawner, phase engine, and
-            // MCP-over-HTTP/SSE surface all land before `serve` does
-            // anything real. Logging (not `println!`) per the style
-            // guide's observability rule, even for a stub.
-            tracing::info!("spec-flow serve is not yet implemented");
+            // §11.1: the global config is where `listen` and the project
+            // registry live, so an absent one is a hard error here (a
+            // daemon with no address and no projects has nothing to do),
+            // unlike `init` below, which legitimately runs before the
+            // file exists.
+            let path = spec_flow::global_config_path().context(
+                "could not locate the machine-global config \
+                 (~/.config/spec-flow/config.yaml)",
+            )?;
+            let global =
+                spec_flow::load_global_config(&path).with_context(|| {
+                    format!(
+                        "could not read {}; run `spec-flow init` in a repo \
+                         first",
+                        path.display()
+                    )
+                })?;
+            let vcs = spec_flow::ShellVcs::new(
+                global.binaries.git.clone(),
+                global.binaries.gh.clone(),
+            );
+
+            // Built here rather than via `#[tokio::main]` so `init` pays
+            // nothing for it -- see this module's doc.
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("could not start the async runtime")?
+                .block_on(spec_flow::serve(global, vcs))?;
             Ok(())
         }
         Command::Init(args) => {

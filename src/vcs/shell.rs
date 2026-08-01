@@ -43,6 +43,12 @@ use super::{
 /// [`IssueJson`] declares them.
 const ISSUE_FIELDS: &str = "number,title,body,labels,state";
 
+/// The `gh issue list` fields [`Vcs::list_open_issues`] requests.
+///
+/// Just the number: see that method's doc for why it deliberately does
+/// not fetch the rest of an issue here.
+const ISSUE_LIST_FIELDS: &str = "number";
+
 /// The `gh pr view` fields [`Vcs::open_pr`] reads back after creating a
 /// pull request.
 const PULL_REQUEST_FIELDS: &str = "number,url,headRefName";
@@ -532,6 +538,46 @@ impl Vcs for ShellVcs {
         })
     }
 
+    /// # `--state open` is passed explicitly, `--limit` always
+    ///
+    /// `gh issue list` already defaults to `--state open` and
+    /// `--limit 30` (confirmed against `gh` 2.83.0's own `--help`, and by
+    /// running the command live). Neither default is relied on: the state
+    /// filter is the whole contract of
+    /// [`Vcs::list_open_issues`](super::Vcs::list_open_issues) and must
+    /// not silently change under a future `gh`, and a caller that asked
+    /// for a specific `limit` must get that one, not 30. Both are
+    /// therefore spelled out in the argument vector.
+    ///
+    /// `gh issue list` returns pull requests' sibling resource — issues
+    /// only — so no PR filtering is needed here (unlike GitHub's REST
+    /// `/issues` endpoint, which folds PRs in).
+    fn list_open_issues(
+        &self,
+        repo: &str,
+        limit: u32,
+    ) -> Result<Vec<u64>, VcsError> {
+        let limit = limit.to_string();
+        let args = ShellVcs::gh_args(
+            &[
+                "issue",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                &limit,
+                "--json",
+                ISSUE_LIST_FIELDS,
+            ],
+            repo,
+        );
+
+        let issues: Vec<IssueNumberJson> =
+            self.run_json(&self.gh_binary, &args, None)?;
+
+        Ok(issues.into_iter().map(|issue| issue.number).collect())
+    }
+
     /// # `label` must survive `gh`'s CSV-based flag parsing
     ///
     /// `--add-label`/`--remove-label` are `pflag` `StringSliceVar`
@@ -914,6 +960,19 @@ struct IssueJson {
     body: String,
     labels: Vec<LabelJson>,
     state: IssueStateJson,
+}
+
+/// One element of a `gh issue list --json number` payload.
+///
+/// Separate from [`IssueJson`] rather than a reuse of it with everything
+/// `Option`: `gh issue list` returns exactly the fields `--json` asked
+/// for, so the two payloads genuinely have different shapes, and making
+/// [`IssueJson`]'s fields optional to share one type would let a
+/// [`Vcs::read_issue`] response missing `title`/`state` deserialize
+/// silently instead of failing.
+#[derive(Debug, Deserialize)]
+struct IssueNumberJson {
+    number: u64,
 }
 
 /// One entry of `gh`'s `labels` array — both an issue's `labels` field
@@ -1426,6 +1485,61 @@ mod tests {
         assert!(matches!(
             vcs.read_issue("owner/repo-a", 7),
             Err(VcsError::InvalidJson { .. })
+        ));
+    }
+
+    #[test]
+    fn list_open_issues_parses_the_numbers_and_pins_every_filter_flag() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed(r#"[{"number":42},{"number":7},{"number":3}]"#);
+        let vcs = shell_vcs(runner.clone());
+
+        let numbers = vcs.list_open_issues("owner/repo-a", 250).unwrap();
+
+        assert_eq!(numbers, vec![42, 7, 3]);
+        // `--state`/`--limit` are asserted here, not left to `gh`'s own
+        // defaults, precisely because those defaults (`open`, `30`) would
+        // make a version of this method that omitted both flags pass an
+        // output-only test while silently capping a large backlog at 30.
+        assert_call(
+            &runner.calls()[0],
+            "gh",
+            &[
+                "issue",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                "250",
+                "--json",
+                ISSUE_LIST_FIELDS,
+                "--repo",
+                "owner/repo-a",
+            ],
+        );
+    }
+
+    #[test]
+    fn list_open_issues_returns_nothing_for_a_repo_with_no_open_issues() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed("[]");
+        let vcs = shell_vcs(runner);
+
+        assert!(vcs.list_open_issues("owner/repo-a", 30).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_open_issues_reports_a_failed_gh_call_rather_than_an_empty_board() {
+        // An unreachable/unauthenticated `gh` must never look like "this
+        // repo has no issues" -- a silently empty board would read as a
+        // finished queue (§2.7) rather than a broken one.
+        let runner = Arc::new(FakeRunner::new());
+        runner.fail(1, "could not resolve to a Repository");
+        let vcs = shell_vcs(runner);
+
+        assert!(matches!(
+            vcs.list_open_issues("owner/repo-a", 30),
+            Err(VcsError::CommandFailed { .. })
         ));
     }
 
