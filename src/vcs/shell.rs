@@ -35,8 +35,8 @@ use self::runner::{
     CommandOutput, CommandRunner, ProcessRunner, command_line,
 };
 use super::{
-    IssueRef, IssueRelationships, IssueState, PullRequestRef, Vcs, VcsError,
-    Worktree, branch_slug,
+    CiConclusion, IssueRef, IssueRelationships, IssueState, PullRequestRef,
+    PullRequestState, PullRequestStatus, Vcs, VcsError, Worktree, branch_slug,
 };
 
 /// The `gh issue view` fields [`Vcs::read_issue`] requests, in the order
@@ -72,6 +72,51 @@ query($owner: String!, $name: String!, $number: Int!) {
       subIssues(first: 100) { nodes { number } }
       blockedBy(first: 100) { nodes { number } }
       blocking(first: 100) { nodes { number } }
+    }
+  }
+}";
+
+/// GitHub's "Development" linked-PR feature for one issue (§4.1, §4.2
+/// `signals`).
+///
+/// `closedByPullRequestsReferences` is confirmed present on the live
+/// GraphQL schema (checked via `gh api graphql` introspection against
+/// `__type(name: "Issue")`, and end-to-end against a real issue/PR pair,
+/// while building [`Vcs::find_linked_pull_requests`]).
+/// `includeClosedPrs: true` so a closed-without-merging PR still
+/// surfaces — the caller decides what a stale link means, not this
+/// layer.
+const LINKED_PULL_REQUESTS_QUERY: &str = "\
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
+        nodes { number url headRefName }
+      }
+    }
+  }
+}";
+
+/// A pull request's state, CI conclusion, and merge-queue enrollment
+/// (§4.2 `signals`, §12).
+///
+/// `mergeQueueEntry` is non-null exactly when the pull request currently
+/// holds a merge-queue entry (§8.1). `commits(last: 1).../
+/// statusCheckRollup.state` is the same aggregated rollup `gh pr view
+/// --json statusCheckRollup` exposes as a per-check list, but as a single
+/// `StatusState` already reduced across every check on the latest commit
+/// (confirmed via introspection on `Commit.statusCheckRollup` and a live
+/// query against a real pull request while building
+/// [`Vcs::read_pull_request_status`]) — no client-side aggregation needed.
+const PULL_REQUEST_STATUS_QUERY: &str = "\
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      state
+      mergeQueueEntry { state }
+      commits(last: 1) {
+        nodes { commit { statusCheckRollup { state } } }
+      }
     }
   }
 }";
@@ -609,6 +654,125 @@ impl Vcs for ShellVcs {
             sub_issues: issue.sub_issues.numbers(),
         })
     }
+
+    fn find_linked_pull_requests(
+        &self,
+        repo: &str,
+        issue_number: u64,
+    ) -> Result<Vec<PullRequestRef>, VcsError> {
+        let (owner, name) = ShellVcs::split_repo(repo);
+        let query_var = format!("query={LINKED_PULL_REQUESTS_QUERY}");
+        let owner_var = format!("owner={owner}");
+        let name_var = format!("name={name}");
+        let number_var = format!("number={issue_number}");
+        let args = [
+            "api",
+            "graphql",
+            "-f",
+            &query_var,
+            "-f",
+            &owner_var,
+            "-f",
+            &name_var,
+            "-F",
+            &number_var,
+        ];
+
+        let response: GraphQlResponse<LinkedPullRequestsData> =
+            self.run_json(&self.gh_binary, &args, None)?;
+
+        let Some(issue) =
+            response.data.repository.and_then(|repository| repository.issue)
+        else {
+            warn!(
+                repo = repo,
+                issue = issue_number,
+                "linked-pull-request query resolved no such issue"
+            );
+            return Ok(Vec::new());
+        };
+
+        Ok(issue
+            .closed_by_pull_requests_references
+            .nodes
+            .into_iter()
+            .map(|node| PullRequestRef {
+                number: node.number,
+                url: node.url,
+                branch: node.head_ref_name,
+            })
+            .collect())
+    }
+
+    fn read_pull_request_status(
+        &self,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<PullRequestStatus, VcsError> {
+        let (owner, name) = ShellVcs::split_repo(repo);
+        let query_var = format!("query={PULL_REQUEST_STATUS_QUERY}");
+        let owner_var = format!("owner={owner}");
+        let name_var = format!("name={name}");
+        let number_var = format!("number={pr_number}");
+        let args = [
+            "api",
+            "graphql",
+            "-f",
+            &query_var,
+            "-f",
+            &owner_var,
+            "-f",
+            &name_var,
+            "-F",
+            &number_var,
+        ];
+
+        let response: GraphQlResponse<PullRequestStatusData> =
+            self.run_json(&self.gh_binary, &args, None)?;
+
+        let Some(pr) = response
+            .data
+            .repository
+            .and_then(|repository| repository.pull_request)
+        else {
+            return Err(VcsError::CommandFailed {
+                command: command_line(&self.gh_binary, &args),
+                status: 1,
+                stderr: format!("no such pull request {repo}#{pr_number}"),
+            });
+        };
+
+        let state = match pr.state {
+            PullRequestStateJson::Open => PullRequestState::Open,
+            PullRequestStateJson::Closed => PullRequestState::Closed,
+            PullRequestStateJson::Merged => PullRequestState::Merged,
+        };
+
+        // No commits, or a commit with no reported checks yet, both read
+        // as `Pending` — a brand-new PR must never default to `Success`.
+        let ci = pr
+            .commits
+            .nodes
+            .first()
+            .and_then(|node| node.commit.status_check_rollup.as_ref())
+            .map(|rollup| match rollup.state {
+                StatusStateJson::Expected | StatusStateJson::Pending => {
+                    CiConclusion::Pending
+                }
+                StatusStateJson::Error | StatusStateJson::Failure => {
+                    CiConclusion::Failure
+                }
+                StatusStateJson::Success => CiConclusion::Success,
+            })
+            .unwrap_or(CiConclusion::Pending);
+
+        Ok(PullRequestStatus {
+            number: pr_number,
+            state,
+            ci,
+            in_merge_queue: pr.merge_queue_entry.is_some(),
+        })
+    }
 }
 
 /// One `gh repo view --json nameWithOwner` payload.
@@ -717,6 +881,119 @@ impl IssueNumberConnection {
 #[derive(Debug, Deserialize)]
 struct IssueNumberNode {
     number: u64,
+}
+
+/// [`LINKED_PULL_REQUESTS_QUERY`]'s `data`.
+#[derive(Debug, Deserialize)]
+struct LinkedPullRequestsData {
+    repository: Option<LinkedPullRequestsRepository>,
+}
+
+/// [`LINKED_PULL_REQUESTS_QUERY`]'s `data.repository`.
+#[derive(Debug, Deserialize)]
+struct LinkedPullRequestsRepository {
+    issue: Option<LinkedPullRequestsIssue>,
+}
+
+/// [`LINKED_PULL_REQUESTS_QUERY`]'s `data.repository.issue`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkedPullRequestsIssue {
+    closed_by_pull_requests_references: PullRequestNodeConnection,
+}
+
+/// A GraphQL pull-request connection reduced to `number`/`url`/
+/// `headRefName`.
+#[derive(Debug, Deserialize)]
+struct PullRequestNodeConnection {
+    nodes: Vec<PullRequestNode>,
+}
+
+/// One node of [`PullRequestNodeConnection`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestNode {
+    number: u64,
+    url: String,
+    head_ref_name: String,
+}
+
+/// [`PULL_REQUEST_STATUS_QUERY`]'s `data`.
+#[derive(Debug, Deserialize)]
+struct PullRequestStatusData {
+    repository: Option<PullRequestStatusRepository>,
+}
+
+/// [`PULL_REQUEST_STATUS_QUERY`]'s `data.repository`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestStatusRepository {
+    pull_request: Option<PullRequestStatusNode>,
+}
+
+/// [`PULL_REQUEST_STATUS_QUERY`]'s `data.repository.pullRequest`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestStatusNode {
+    state: PullRequestStateJson,
+    merge_queue_entry: Option<MergeQueueEntryJson>,
+    commits: PullRequestCommitsConnection,
+}
+
+/// `PullRequest.state`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+enum PullRequestStateJson {
+    Open,
+    Closed,
+    Merged,
+}
+
+/// `PullRequest.mergeQueueEntry` — only its presence matters here; the
+/// entry's own `state` (queued/awaiting-checks/mergeable/...) is beyond
+/// this step's scope (§14 step 4 covers signals, not scheduling).
+#[derive(Debug, Deserialize)]
+struct MergeQueueEntryJson {
+    #[allow(dead_code)]
+    state: String,
+}
+
+/// `PullRequest.commits(last: 1)`.
+#[derive(Debug, Deserialize)]
+struct PullRequestCommitsConnection {
+    nodes: Vec<PullRequestCommitNode>,
+}
+
+/// One node of [`PullRequestCommitsConnection`].
+#[derive(Debug, Deserialize)]
+struct PullRequestCommitNode {
+    commit: CommitStatusNode,
+}
+
+/// `Commit.statusCheckRollup` — null when the commit has no reported
+/// checks yet.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitStatusNode {
+    status_check_rollup: Option<StatusCheckRollupJson>,
+}
+
+/// `StatusCheckRollup.state` — GitHub's own aggregation of every check
+/// run/status context on the commit into one `StatusState`.
+#[derive(Debug, Deserialize)]
+struct StatusCheckRollupJson {
+    state: StatusStateJson,
+}
+
+/// The `StatusState` enum.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+enum StatusStateJson {
+    Expected,
+    Error,
+    Failure,
+    Pending,
+    Success,
 }
 
 #[cfg(test)]
@@ -1180,6 +1457,126 @@ mod tests {
             vcs.read_relationships("owner/repo-a", 42).unwrap();
 
         assert_eq!(relationships, IssueRelationships::default());
+    }
+
+    #[test]
+    fn find_linked_pull_requests_parses_the_native_graphql_nodes() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed(
+            r#"{"data":{"repository":{"issue":{
+                "closedByPullRequestsReferences":{"nodes":[
+                    {"number":22,
+                     "url":"https://github.com/owner/repo-a/pull/22",
+                     "headRefName":"issue-19-widget-cache"}
+                ]}}}}}"#,
+        );
+        let vcs = shell_vcs(runner.clone());
+
+        let prs = vcs.find_linked_pull_requests("owner/repo-a", 19).unwrap();
+
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 22);
+        assert_eq!(prs[0].url, "https://github.com/owner/repo-a/pull/22");
+        assert_eq!(prs[0].branch, "issue-19-widget-cache");
+        let calls = runner.calls();
+        assert_eq!(&calls[0].args[..2], &["api", "graphql"]);
+        assert!(calls[0].args.contains(&"number=19".to_string()));
+    }
+
+    #[test]
+    fn find_linked_pull_requests_is_empty_when_none_are_linked() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed(
+            r#"{"data":{"repository":{"issue":{
+                "closedByPullRequestsReferences":{"nodes":[]}}}}}"#,
+        );
+        let vcs = shell_vcs(runner);
+
+        let prs = vcs.find_linked_pull_requests("owner/repo-a", 19).unwrap();
+
+        assert!(prs.is_empty());
+    }
+
+    #[test]
+    fn find_linked_pull_requests_is_empty_when_the_issue_is_missing() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed(r#"{"data":{"repository":{"issue":null}}}"#);
+        let vcs = shell_vcs(runner);
+
+        let prs = vcs.find_linked_pull_requests("owner/repo-a", 19).unwrap();
+
+        assert!(prs.is_empty());
+    }
+
+    #[test]
+    fn read_pull_request_status_parses_state_ci_and_merge_queue() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed(
+            r#"{"data":{"repository":{"pullRequest":{
+                "state":"OPEN",
+                "mergeQueueEntry":{"state":"QUEUED"},
+                "commits":{"nodes":[{"commit":{
+                    "statusCheckRollup":{"state":"SUCCESS"}}}]}}}}}"#,
+        );
+        let vcs = shell_vcs(runner.clone());
+
+        let status = vcs.read_pull_request_status("owner/repo-a", 7).unwrap();
+
+        assert_eq!(status.number, 7);
+        assert_eq!(status.state, PullRequestState::Open);
+        assert_eq!(status.ci, CiConclusion::Success);
+        assert!(status.in_merge_queue);
+        let calls = runner.calls();
+        assert_eq!(&calls[0].args[..2], &["api", "graphql"]);
+        assert!(calls[0].args.contains(&"number=7".to_string()));
+    }
+
+    #[test]
+    fn read_pull_request_status_maps_a_failing_check_to_failure() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed(
+            r#"{"data":{"repository":{"pullRequest":{
+                "state":"OPEN",
+                "mergeQueueEntry":null,
+                "commits":{"nodes":[{"commit":{
+                    "statusCheckRollup":{"state":"FAILURE"}}}]}}}}}"#,
+        );
+        let vcs = shell_vcs(runner);
+
+        let status = vcs.read_pull_request_status("owner/repo-a", 7).unwrap();
+
+        assert_eq!(status.ci, CiConclusion::Failure);
+        assert!(!status.in_merge_queue);
+    }
+
+    #[test]
+    fn read_pull_request_status_maps_a_merged_pr_with_no_checks_to_pending() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed(
+            r#"{"data":{"repository":{"pullRequest":{
+                "state":"MERGED",
+                "mergeQueueEntry":null,
+                "commits":{"nodes":[{"commit":{
+                    "statusCheckRollup":null}}]}}}}}"#,
+        );
+        let vcs = shell_vcs(runner);
+
+        let status = vcs.read_pull_request_status("owner/repo-a", 7).unwrap();
+
+        assert_eq!(status.state, PullRequestState::Merged);
+        assert_eq!(status.ci, CiConclusion::Pending);
+    }
+
+    #[test]
+    fn read_pull_request_status_reports_a_missing_pr_as_command_failed() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed(r#"{"data":{"repository":{"pullRequest":null}}}"#);
+        let vcs = shell_vcs(runner);
+
+        assert!(matches!(
+            vcs.read_pull_request_status("owner/repo-a", 7),
+            Err(VcsError::CommandFailed { .. })
+        ));
     }
 
     #[test]

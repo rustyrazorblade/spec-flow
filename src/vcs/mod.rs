@@ -182,6 +182,52 @@ pub struct IssueRelationships {
     pub sub_issues: Vec<u64>,
 }
 
+/// Whether a pull request is open, closed, or merged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PullRequestState {
+    /// The pull request is open.
+    Open,
+    /// The pull request was closed without merging.
+    Closed,
+    /// The pull request was merged.
+    Merged,
+}
+
+/// A pull request's CI conclusion, aggregated across every check run
+/// against its latest commit (§4.2 `signals`, §12).
+///
+/// This collapses GitHub's richer per-check-run/per-status-context state
+/// (`StatusState`: `EXPECTED`/`ERROR`/`FAILURE`/`PENDING`/`SUCCESS`) down
+/// to the three-way signal the phase engine's `requires: {ci: green}`
+/// gate (§7.1, §11.3) actually branches on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CiConclusion {
+    /// At least one check is still running, or the commit has no
+    /// reported checks at all yet (a PR the daemon just opened, before
+    /// Actions has even started, must not read as `Success` by default).
+    Pending,
+    /// Every reported check succeeded.
+    Success,
+    /// At least one check failed or errored.
+    Failure,
+}
+
+/// A pull request's current state, CI conclusion, and merge-queue
+/// enrollment (§4.2 `signals`), as read by
+/// [`Vcs::read_pull_request_status`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PullRequestStatus {
+    /// The pull request number this status was read for.
+    pub number: u64,
+    /// Open, closed, or merged.
+    pub state: PullRequestState,
+    /// The aggregated CI conclusion for its latest commit.
+    pub ci: CiConclusion,
+    /// Whether the pull request currently holds a merge-queue entry
+    /// (§8.1) — queued, awaiting checks, or otherwise still enrolled.
+    pub in_merge_queue: bool,
+}
+
 /// The `git`/`gh` subprocess seam (§5, §8.5).
 ///
 /// One method per mechanical operation the daemon performs directly
@@ -316,6 +362,31 @@ pub trait Vcs {
         repo: &str,
         issue_number: u64,
     ) -> Result<IssueRelationships, VcsError>;
+
+    /// Find every pull request GitHub's "Development" linked-PR feature
+    /// associates with `issue_number` — the PRs that would close it on
+    /// merge (§4.1, §4.2 `signals`), via `gh api graphql`.
+    ///
+    /// Returns every linked PR GitHub reports, in the order it reports
+    /// them (an empty vec when the issue has none). The common case is
+    /// exactly one, per the 1:1:1:1 invariant (§4.1); this layer makes no
+    /// assumption about that and does no picking — a caller that finds
+    /// more than one is looking at a case a later step defines the
+    /// meaning of, not something to silently collapse here.
+    fn find_linked_pull_requests(
+        &self,
+        repo: &str,
+        issue_number: u64,
+    ) -> Result<Vec<PullRequestRef>, VcsError>;
+
+    /// Read `pr_number`'s current state, CI conclusion, and merge-queue
+    /// enrollment (§4.2 `signals`, §12 CI/PR poller), via
+    /// `gh api graphql`.
+    fn read_pull_request_status(
+        &self,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<PullRequestStatus, VcsError>;
 
     /// Verify `git` and `gh` are present and `gh` is authenticated for
     /// `repo` — the composite check `spec-flow init` runs up front (§6).

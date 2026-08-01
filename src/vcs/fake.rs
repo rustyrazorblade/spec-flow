@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::{
-    IssueRef, IssueRelationships, PullRequestRef, Vcs, VcsError, Worktree,
-    branch_slug,
+    IssueRef, IssueRelationships, PullRequestRef, PullRequestStatus, Vcs,
+    VcsError, Worktree, branch_slug,
 };
 
 /// An in-memory [`Vcs`] implementation for tests.
@@ -80,6 +80,16 @@ pub struct FakeVcs {
     /// `(repo, pr_number)` pairs passed to [`Vcs::enqueue_merge`], in
     /// call order.
     pub merges_enqueued: RefCell<Vec<(String, u64)>>,
+    /// Pull requests [`Vcs::find_linked_pull_requests`] returns, keyed by
+    /// `(repo, issue_number)`; an unlisted issue reads back as having
+    /// none linked.
+    pub linked_pull_requests:
+        RefCell<HashMap<(String, u64), Vec<PullRequestRef>>>,
+    /// Statuses [`Vcs::read_pull_request_status`] can return, keyed by
+    /// `(repo, pr_number)` — **not** a bare PR number, for the same
+    /// reason [`issues`](FakeVcs::issues) is repo-keyed (§15).
+    pub pull_request_statuses:
+        RefCell<HashMap<(String, u64), PullRequestStatus>>,
 }
 
 impl FakeVcs {
@@ -110,6 +120,8 @@ impl Default for FakeVcs {
             prs_opened: RefCell::new(Vec::new()),
             next_pr_number: Cell::new(1),
             merges_enqueued: RefCell::new(Vec::new()),
+            linked_pull_requests: RefCell::new(HashMap::new()),
+            pull_request_statuses: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -313,6 +325,38 @@ impl Vcs for FakeVcs {
             .cloned()
             .unwrap_or_default())
     }
+
+    fn find_linked_pull_requests(
+        &self,
+        repo: &str,
+        issue_number: u64,
+    ) -> Result<Vec<PullRequestRef>, VcsError> {
+        Ok(self
+            .linked_pull_requests
+            .borrow()
+            .get(&(repo.to_string(), issue_number))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn read_pull_request_status(
+        &self,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<PullRequestStatus, VcsError> {
+        self.pull_request_statuses
+            .borrow()
+            .get(&(repo.to_string(), pr_number))
+            .cloned()
+            .ok_or_else(|| VcsError::CommandFailed {
+                command: "gh pr view".to_string(),
+                status: 1,
+                stderr: format!(
+                    "no pull request status configured for \
+                     {repo}#{pr_number}"
+                ),
+            })
+    }
 }
 
 #[cfg(test)]
@@ -438,6 +482,62 @@ mod tests {
             vcs.read_issue("owner/repo", 1),
             Err(VcsError::CommandFailed { .. })
         ));
+    }
+
+    #[test]
+    fn find_linked_pull_requests_returns_none_when_unseeded() {
+        let vcs = FakeVcs::new();
+
+        let prs = vcs.find_linked_pull_requests("owner/repo", 42).unwrap();
+
+        assert!(prs.is_empty());
+    }
+
+    #[test]
+    fn find_linked_pull_requests_returns_the_seeded_prs() {
+        let vcs = FakeVcs::new();
+        let pr = PullRequestRef {
+            number: 7,
+            url: "https://github.com/owner/repo/pull/7".to_string(),
+            branch: "issue-42-widget-cache".to_string(),
+        };
+        vcs.linked_pull_requests
+            .borrow_mut()
+            .insert(("owner/repo".to_string(), 42), vec![pr.clone()]);
+
+        let prs = vcs.find_linked_pull_requests("owner/repo", 42).unwrap();
+
+        assert_eq!(prs, vec![pr]);
+    }
+
+    #[test]
+    fn read_pull_request_status_errors_when_not_seeded() {
+        let vcs = FakeVcs::new();
+
+        assert!(matches!(
+            vcs.read_pull_request_status("owner/repo", 7),
+            Err(VcsError::CommandFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn read_pull_request_status_returns_the_seeded_status() {
+        use crate::vcs::{CiConclusion, PullRequestState};
+
+        let vcs = FakeVcs::new();
+        let status = PullRequestStatus {
+            number: 7,
+            state: PullRequestState::Open,
+            ci: CiConclusion::Success,
+            in_merge_queue: false,
+        };
+        vcs.pull_request_statuses
+            .borrow_mut()
+            .insert(("owner/repo".to_string(), 7), status);
+
+        let read = vcs.read_pull_request_status("owner/repo", 7).unwrap();
+
+        assert_eq!(read, status);
     }
 
     #[test]
