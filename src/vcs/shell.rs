@@ -478,6 +478,35 @@ impl Vcs for ShellVcs {
         Ok(())
     }
 
+    fn create_issue(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<IssueRef, VcsError> {
+        let create = ShellVcs::gh_args(
+            &["issue", "create", "--title", title, "--body", body],
+            repo,
+        );
+        // `gh issue create` prints only the new issue's URL
+        // (`.../issues/<number>`) — read it back by number for a typed
+        // result rather than trying to parse anything more than that one
+        // trailing number out of the URL, mirroring `open_pr`'s "create,
+        // then view by a stable key" split.
+        let url = self.run_checked(&self.gh_binary, &create, None)?;
+        let number = url
+            .trim()
+            .rsplit('/')
+            .next()
+            .and_then(|segment| segment.parse::<u64>().ok())
+            .ok_or_else(|| VcsError::UnexpectedOutput {
+                command: command_line(&self.gh_binary, &create),
+                output: url.clone(),
+            })?;
+
+        self.read_issue(repo, number)
+    }
+
     fn read_issue(
         &self,
         repo: &str,
@@ -1262,6 +1291,81 @@ mod tests {
         let vcs = shell_vcs(runner);
 
         assert!(!vcs.merge_queue_enabled("owner/repo-a", "main").unwrap());
+    }
+
+    #[test]
+    fn create_issue_creates_then_reads_the_issue_back_by_its_new_number() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed("https://github.com/owner/repo-a/issues/43\n");
+        runner.succeed(
+            r#"{"number":43,"title":"Widget cache","body":"Do it.",
+                "labels":[],"state":"OPEN"}"#,
+        );
+        let vcs = shell_vcs(runner.clone());
+
+        let issue = vcs
+            .create_issue("owner/repo-a", "Widget cache", "Do it.")
+            .unwrap();
+
+        assert_eq!(issue.number, 43);
+        assert_eq!(issue.title, "Widget cache");
+        let calls = runner.calls();
+        assert_call(
+            &calls[0],
+            "gh",
+            &[
+                "issue",
+                "create",
+                "--title",
+                "Widget cache",
+                "--body",
+                "Do it.",
+                "--repo",
+                "owner/repo-a",
+            ],
+        );
+        assert_call(
+            &calls[1],
+            "gh",
+            &[
+                "issue",
+                "view",
+                "43",
+                "--json",
+                ISSUE_FIELDS,
+                "--repo",
+                "owner/repo-a",
+            ],
+        );
+    }
+
+    #[test]
+    fn create_issue_fails_loudly_when_the_create_output_is_not_an_issue_url() {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed("not a url\n");
+        let vcs = shell_vcs(runner.clone());
+
+        assert!(matches!(
+            vcs.create_issue("owner/repo-a", "t", "b"),
+            Err(VcsError::UnexpectedOutput { .. })
+        ));
+        // No read-back is attempted after a bad URL -- there is no
+        // number to view by.
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[test]
+    fn create_issue_propagates_a_read_back_failure_after_a_successful_create()
+    {
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed("https://github.com/owner/repo-a/issues/43\n");
+        runner.fail(1, "not found");
+        let vcs = shell_vcs(runner);
+
+        assert!(matches!(
+            vcs.create_issue("owner/repo-a", "t", "b"),
+            Err(VcsError::CommandFailed { .. })
+        ));
     }
 
     #[test]

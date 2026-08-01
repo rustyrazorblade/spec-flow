@@ -29,7 +29,7 @@ callers write `spec_flow::GlobalConfig`, not
 |---|---|---|
 | `config.rs` | [`GlobalConfig`]/[`ProjectConfig`] shapes, their file paths, load/save | Implemented (step 1). `instance_id` auto-generation on first `serve` is still open — `serve` itself doesn't exist yet. |
 | `registry.rs` | Idempotent add/list/find over the global config's `projects` list | Implemented (step 1). |
-| `vcs/` | The [`Vcs`] trait (the git/gh subprocess seam), [`ShellVcs`] (real), [`FakeVcs`] (test double) | Fully implemented (step 1) — no `todo!()`s remain in `vcs/shell.rs`. `vcs/mod.rs`'s trait signatures are load-bearing for both implementations and every call site; change them and every caller together. Step 4 added two methods for PR/CI/merge-queue signals: [`Vcs::find_linked_pull_requests`], [`Vcs::read_pull_request_status`]. Step 9 added [`Vcs::ensure_label`] (create a label if absent) to close a real gap: `set_label` cannot add a label that doesn't already exist in the repo, which blocked every fixed-vocabulary `status:`/`gate:`/`approved:` label, not only `claim.rs`'s already-documented per-heartbeat one. |
+| `vcs/` | The [`Vcs`] trait (the git/gh subprocess seam), [`ShellVcs`] (real), [`FakeVcs`] (test double) | Fully implemented (step 1) — no `todo!()`s remain in `vcs/shell.rs`. `vcs/mod.rs`'s trait signatures are load-bearing for both implementations and every call site; change them and every caller together. Step 4 added two methods for PR/CI/merge-queue signals: [`Vcs::find_linked_pull_requests`], [`Vcs::read_pull_request_status`]. Step 9 added [`Vcs::ensure_label`] (create a label if absent) to close a real gap: `set_label` cannot add a label that doesn't already exist in the repo, which blocked every fixed-vocabulary `status:`/`gate:`/`approved:` label, not only `claim.rs`'s already-documented per-heartbeat one; and [`Vcs::create_issue`] (§7.2 ph.1's "the server creates the GitHub issue" mechanic, e.g. for `groom`), which reads the freshly created issue back by number rather than parsing anything beyond that number out of `gh issue create`'s URL output, mirroring [`Vcs::open_pr`]'s "create, then view by a stable key" split. |
 | `state/` | The GitHub-state layer (§4.2, §14 step 4): [`IssueSnapshot`] (derived per-issue state), the pure [`state::derive_issue_state`] label-parsing function, the [`state::read_issue_state`] orchestrator, and drift detection (see [`DriftFinding`]) | Implemented (step 4) for what is derivable from GitHub state alone — dependency cycles, closed/missing dependencies, stale claims, a merged PR against a still-open issue, an issue carrying more than one `status:`/`owner:` label, and an issue with more than one simultaneously **open** linked PR. Deliberately does **not** cover the drift kinds needing the phase engine's or worktree manager's own bookkeeping (a status label disagreeing with reality, an orphaned worktree, an implemented branch with no PR) — those are a later step's job (§14 steps 5/7). |
 | `init.rs` | The `spec-flow init` business logic ([`init`]) | Implemented (step 1): composes `config`, `registry`, `scaffold`, and an injected [`Vcs`]. Step 9 added label-vocabulary provisioning: after scaffolding, `init` reads the repo's *effective* `.spec-flow/workflow.yaml` back off disk (a team's hand-edit, not always the compiled-in default), derives every label name [`crate::workflow::label_vocabulary`] returns, and calls [`Vcs::ensure_label`] for each — closing the gap `vcs/`'s row above describes. |
 | `scaffold.rs` | The committed `.spec-flow/` files `init` materializes: the default `workflow.yaml` (§11.3) and one `instructions/<point>.md` per injection point (§9.1) | Implemented (step 1). Base-template content (§14 step 6 Deliverable B) is **partial**: `groom` and `implement` now hold real, substantive templates distilled from this plugin's `product-manager`/`groom` and `tdd-developer`/`implement` agent/skill content; the remaining 17 injection points still hold the original thin placeholder — authoring those is unfinished work, not done here. |
@@ -39,6 +39,7 @@ callers write `spec_flow::GlobalConfig`, not
 | `schedule.rs` | The scheduler's default ordering (§12, §14 step 5): the pure [`schedule::next_action`]/[`schedule::schedule_order`] functions (actionable-now → furthest-along → priority → age) | Implemented (step 5) over the shipped-default [`schedule::DEFAULT_PHASE_ORDER`] (§7.2) — see its module doc for what's deferred: a workflow-config-defined phase order, a "dependency" tie-break ahead of age, and the CI/PR poller's backoff loop (all §14 step 6+ or later). |
 | `workflow/` | The workflow-config data model + parser (§7, §14 step 7): [`workflow::WorkflowConfig`] and its nested types, deserialized straight from `scaffold::DEFAULT_WORKFLOW_YAML`; gate evaluation ([`workflow::gate_clear`] and friends, §2.3b/§4.3); `requires` evaluation ([`workflow::requirement_satisfied`], §7.1); the review-panel/bounded-fix-loop decision primitive ([`workflow::evaluate_panel`], §7.1); and `advance`/`approve`/`set_gate` as plain, pure functions (§6) | Implemented (step 7) as pure data + pure functions only — see the module's own doc for exactly what is and is not covered; no phase engine, spawner wiring, or MCP server calls any of it yet. Step 9 added [`workflow::label_vocabulary`] (every GitHub label name the config actually uses), consumed by `init`. |
 | `merge.rs` | Merge-queue integration (§8.1, §14 step 8): [`merge::plan_merge`] (gate → enqueue, native mode) and [`merge::observe_merge`] (observe) as pure functions | Implemented (step 8) for the **native** merge queue only — see the module's own doc for why the serialized fallback (§8.1's warn-and-degrade path) is a documented, deliberately unresolved gap rather than a guess: it hinges on §8.3's lease model, itself an open question (§16 item 5). `init`'s merge-queue-enabled check (this step's other named deliverable) was already implemented in step 1 (`init::detect_merge_mode`); nothing changed there. |
+| `implement.rs` | `start_implement` kickoff (§10.2, §14 step 9): [`start_implement_setup`] (claim the worktree, read the issue, decide spec-author-vs-skip) and [`finish_implement_setup`] (commit the spec if one was authored, push, post the dev plan) as two `Vcs`-touching orchestration functions | Implemented (step 9) for the mechanics either side of the spawned spec-authoring agent §10.2 places between them — the actual spawn is a future step's job (no spawner wiring exists yet). Does not itself claim the issue; that's `crate::claim`'s job, called before this module. |
 | `main.rs` (binary, not part of this library) | `clap` CLI wiring, `tracing` setup, `anyhow` error reporting at the top level | `init` is fully wired (step 1); the `serve` subcommand (the MCP server itself) is a stub — out of scope until spec §14 step 6+. |
 
 # What is deliberately *not* here yet
@@ -49,20 +50,31 @@ work-claiming and the scheduler's ordering, the instruction composer's
 pure mechanism, the workflow-config parser plus the phase engine's pure
 decision logic, and native merge-queue integration) plus the step-2
 spike recorded in `docs/memory-index-spike.md` (no code needed there),
-and **one slice of step 9** so far: label-vocabulary provisioning
+and **two slices of step 9** so far: label-vocabulary provisioning
 (`init` now creates every `status:`/`gate:`/`approved:`/`spec:skip`
 label a project's workflow declares, via the new [`Vcs::ensure_label`]
 and [`workflow::label_vocabulary`]) — this only runs when `init` itself
 runs, so a team that edits `workflow.yaml` *after* `init` and never
 re-runs it still hits the same "label doesn't exist" failure for
-whatever it added (see `provision_label_vocabulary`'s doc). Step 9's
-other named deliverables —
-`start_implement`'s worktree/spec-authoring kickoff (§10.2), `board`/
-report aggregation (§13), and the mechanical support `groom`/
-`conflict-check` need (creating an issue, proposing dependency edges,
-§8.4) — remain unbuilt; the last of those needs new `Vcs` methods
-(`create_issue`, `link`/`unlink`) this crate does not have yet. It still
-has no async runtime, no MCP crate, and no actual phase engine wiring.
+whatever it added (see `provision_label_vocabulary`'s doc) — and
+`start_implement`'s worktree/spec-authoring kickoff mechanics
+(`implement.rs`). Step 9's remaining named deliverables — `board`/report
+aggregation (§13), and the `link`/`unlink` write side of `conflict-check`'s
+proposed dependency edges (§8.4) — remain unbuilt. `link`/`unlink`
+specifically need resolving an issue number to its GraphQL node ID
+first (confirmed via live `gh api graphql` schema introspection:
+`addBlockedBy`/`removeBlockedBy`/`addSubIssue`/`removeSubIssue` all take
+`ID!` arguments, not issue numbers) plus a decision about what happens
+on orgs with native issue dependencies switched off (`read_relationships`
+already falls back to parsing `Depends on #N` from the issue body on the
+*read* side; the *write*-side equivalent — editing the issue body
+instead — needs an `update_issue` `Vcs` method this crate doesn't have
+either) — deferred rather than guessed at, and not actually needed by
+`conflict-check`'s own mechanic anyway, since that phase only *proposes*
+edges in a posted comment (already fully supported via
+[`Vcs::post_comment`]); an operator's separate `link` call is what
+actually confirms one, and no caller for it exists yet regardless. It
+still has no async runtime, no MCP crate, and no actual phase engine wiring.
 In particular, step 5 stops short of an actual polling loop: the
 `schedule` module's doc records why a CI/PR poller's backoff timer is
 out of scope until an async runtime exists. Step 6 stops short of
@@ -89,6 +101,10 @@ pub use crate::config::{
     HarnessesConfig, Limits, MergeMode, ProjectConfig, ProjectPointer,
     global_config_path, load_global_config, load_project_config,
     project_config_path, save_global_config, save_project_config,
+};
+pub use crate::implement::{
+    SpecDecision, StartImplementSetup, finish_implement_setup,
+    start_implement_setup,
 };
 pub use crate::init::{InitError, InitOptions, init};
 pub use crate::instructions::{
@@ -139,6 +155,7 @@ pub use crate::workflow::{
 
 mod claim;
 mod config;
+mod implement;
 mod init;
 mod instructions;
 mod merge;

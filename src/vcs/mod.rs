@@ -87,6 +87,19 @@ pub enum VcsError {
         /// against.
         repo: String,
     },
+
+    /// The subprocess exited successfully with output that was not
+    /// JSON at all (so [`VcsError::InvalidJson`] doesn't apply) but
+    /// still didn't match the plain-text shape the caller expected —
+    /// e.g. [`Vcs::create_issue`] expecting `gh issue create`'s stdout
+    /// to be a `.../issues/<number>` URL.
+    #[error("unexpected output from `{command}`: {output:?}")]
+    UnexpectedOutput {
+        /// The command line whose output didn't match.
+        command: String,
+        /// The actual output received.
+        output: String,
+    },
 }
 
 /// A local worktree/branch checkout for one issue (§4.2, §10.1).
@@ -310,6 +323,18 @@ pub trait Vcs {
     /// Push `branch` from `worktree_path` to its remote.
     fn push(&self, worktree_path: &Path, branch: &str)
     -> Result<(), VcsError>;
+
+    /// Create an issue in `repo` (§6 `create_issue`, §7.2 ph.1's "the
+    /// server creates/labels the GitHub issue"). Returns the created
+    /// issue read back in full — freshly assigned `number`, `state:
+    /// Open`, and no labels yet (§4.3's gate/status stamping is a
+    /// separate [`Vcs::set_label`] call, not this one's job).
+    fn create_issue(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<IssueRef, VcsError>;
 
     /// Read one issue from `repo`.
     fn read_issue(

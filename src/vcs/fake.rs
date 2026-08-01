@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::{
-    IssueRef, IssueRelationships, PullRequestRef, PullRequestStatus, Vcs,
-    VcsError, Worktree, branch_slug,
+    IssueRef, IssueRelationships, IssueState, PullRequestRef,
+    PullRequestStatus, Vcs, VcsError, Worktree, branch_slug,
 };
 
 /// An in-memory [`Vcs`] implementation for tests.
@@ -47,6 +47,12 @@ pub struct FakeVcs {
     /// requires them to be (one daemon serves many repos; issue numbers
     /// are only unique per repo).
     pub issues: RefCell<HashMap<(String, u64), IssueRef>>,
+    /// The issue number the next [`Vcs::create_issue`] call assigns;
+    /// increments after each call. A single counter shared across every
+    /// repo, mirroring [`FakeVcs::next_pr_number`]'s same simplification
+    /// (real GitHub issue numbers are per-repo, but nothing in this
+    /// crate's tests needs the fake to model that distinction).
+    pub next_issue_number: Cell<u64>,
     /// Relationships [`Vcs::read_relationships`] returns, keyed by
     /// `(repo, issue_number)`; an unlisted issue reads back as having
     /// none.
@@ -114,6 +120,7 @@ impl Default for FakeVcs {
             default_branches: RefCell::new(HashMap::new()),
             merge_queue_enabled_repos: RefCell::new(HashSet::new()),
             issues: RefCell::new(HashMap::new()),
+            next_issue_number: Cell::new(1),
             relationships: RefCell::new(HashMap::new()),
             worktrees_created: RefCell::new(Vec::new()),
             worktrees_removed: RefCell::new(Vec::new()),
@@ -239,6 +246,32 @@ impl Vcs for FakeVcs {
             .borrow_mut()
             .push((worktree_path.to_path_buf(), branch.to_string()));
         Ok(())
+    }
+
+    fn create_issue(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<IssueRef, VcsError> {
+        let number = self.next_issue_number.get();
+        self.next_issue_number.set(number + 1);
+        let issue = IssueRef {
+            number,
+            title: title.to_string(),
+            body: body.to_string(),
+            labels: Vec::new(),
+            state: IssueState::Open,
+        };
+        let key = (repo.to_string(), number);
+        debug_assert!(
+            !self.issues.borrow().contains_key(&key),
+            "a hand-seeded issue already occupies {key:?} -- seed at a \
+             number `next_issue_number` won't reach, or don't mix seeding \
+             with create_issue on the same fake"
+        );
+        self.issues.borrow_mut().insert(key, issue.clone());
+        Ok(issue)
     }
 
     fn read_issue(
@@ -511,6 +544,31 @@ mod tests {
 
         assert_eq!(first.number, 1);
         assert_eq!(second.number, 2);
+    }
+
+    #[test]
+    fn create_issue_assigns_increasing_numbers_and_reads_back_open() {
+        let vcs = FakeVcs::new();
+
+        let first = vcs.create_issue("owner/repo", "First", "a").unwrap();
+        let second = vcs.create_issue("owner/repo", "Second", "b").unwrap();
+
+        assert_eq!(first.number, 1);
+        assert_eq!(second.number, 2);
+        assert_eq!(second.title, "Second");
+        assert_eq!(second.state, IssueState::Open);
+        assert!(second.labels.is_empty());
+    }
+
+    #[test]
+    fn create_issue_is_visible_to_a_subsequent_read_issue() {
+        let vcs = FakeVcs::new();
+
+        let created =
+            vcs.create_issue("owner/repo", "Widget cache", "Do it.").unwrap();
+        let read = vcs.read_issue("owner/repo", created.number).unwrap();
+
+        assert_eq!(read, created);
     }
 
     #[test]
