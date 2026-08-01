@@ -1,0 +1,61 @@
+[package]
+name = "spec-flow"
+version = "0.1.0"
+edition = "2024"
+description = """
+spec-flow — a standalone, project-agnostic MCP daemon that owns the work \
+queue and git/GitHub mechanics for AI-agent software delivery. See \
+/agent-fleet-manager-spec.md for the full specification.
+"""
+license = "Apache-2.0"
+repository = "https://github.com/rustyrazorblade/skills"
+publish = false
+
+# `cargo doc` renders the crate doc comment in `src/lib.rs`; keep this in
+# sync with the design note there rather than duplicating it here.
+
+[[bin]]
+name = "spec-flow"
+path = "src/main.rs"
+
+[lib]
+name = "spec_flow"
+path = "src/lib.rs"
+
+[dependencies]
+# Config + committed workflow files (§11) are YAML; issue/PR payloads read
+# back from `gh --json ...` / `gh api graphql` (§8.4, §8.5) are JSON.
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+
+# Config durations (`heartbeat_ttl: 1h`, `phase_timeout: 45m`, §11.1) are
+# human-readable strings; this gives them real `std::time::Duration` types
+# on both (de)serialize directions instead of hand-rolled string parsing.
+humantime-serde = "1"
+
+# `spec-flow` the binary: `serve` / `init` subcommands (§14.1).
+clap = { version = "4", features = ["derive"] }
+
+# Error-handling split (rust-style-guide.md §10): hand-written error enums
+# in the library (via thiserror, still no anyhow dependency from the lib
+# crate's public API), anyhow only at the binary's top level (main.rs).
+thiserror = "2"
+anyhow = "1"
+
+# Observability (rust-style-guide.md §13): tracing, never print!.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# `spec-flow init` writes real files (a project config, `.spec-flow/`
+# scaffolding); its tests run against a scratch directory rather than
+# the operator's home or a real checkout.
+tempfile = "3"
+
+# NOTE on MCP (later step, §14 steps 3+): this crate does not depend on an
+# MCP crate or an async runtime yet — step 1 is synchronous CLI scaffolding
+# (registry + git/gh layer + `spec-flow init`) only. When the phase engine /
+# process spawner / MCP server land, the official Rust SDK is `rmcp`
+# (https://github.com/modelcontextprotocol/rust-sdk); pull it in then,
+# alongside `tokio`, not before.
