@@ -10,19 +10,15 @@
 //! is unit-testable by stubbing those seams") rather than shelling out
 //! for real in every test.
 //!
-//! - [`shell`] — [`shell::ShellVcs`], the real implementation.
+//! - [`shell`] — [`shell::ShellVcs`], the real implementation. Fully
+//!   implemented (§14 step 1) — no `todo!()`s remain.
 //! - [`fake`] — [`fake::FakeVcs`], an in-memory test double implementing
 //!   the same trait.
 //!
-//! # Design note for task #3 (the git/gh layer implementation)
-//!
-//! [`shell::ShellVcs`]'s methods are `todo!()` except the two that are
-//! genuinely trivial today: binary-presence checks and the `gh --repo`
-//! argument vector. Everything else — output parsing, error mapping,
-//! `gh api graphql` query bodies for §8.4 relationships — is that task's
-//! design surface; this module only locks in the trait contract (method
-//! signatures, argument/return shapes) so the phase engine (a later
-//! task) can be written against it today.
+//! This trait's method signatures (argument/return shapes) are load-
+//! bearing for both implementations and every call site once the phase
+//! engine (a later step) lands; change one and update every caller in
+//! the same change.
 
 mod fake;
 mod shell;
@@ -112,6 +108,22 @@ pub struct Worktree {
     /// The short human-readable slug embedded in `branch`
     /// (e.g. `widget-cache` in `issue-42-widget-cache`).
     pub slug: String,
+}
+
+/// The short slug embedded in `branch` (`widget-cache` in
+/// `issue-42-widget-cache`), or the whole branch when it does not carry
+/// the conventional prefix.
+///
+/// Shared by [`ShellVcs`] and [`FakeVcs`] so the fake's [`Worktree`]s
+/// carry the same slug the real implementation would derive, rather
+/// than each `impl Vcs` re-deriving (or, for the fake, skipping) it —
+/// a test asserting on `slug` through the fake would otherwise assert
+/// the wrong value.
+pub(crate) fn branch_slug(branch: &str, issue_number: u64) -> String {
+    branch
+        .strip_prefix(&format!("issue-{issue_number}-"))
+        .unwrap_or(branch)
+        .to_string()
 }
 
 /// Whether a GitHub issue is open or closed.
@@ -215,15 +227,32 @@ pub trait Vcs {
 
     /// Create the sibling worktree + branch for `issue_number` under
     /// `project_dir` (§10.1).
+    ///
+    /// `primary_checkout` is the project's known primary checkout
+    /// (`ProjectConfig::local_path`) — the git command needs an
+    /// existing working tree to run from, and it must be *this* repo's,
+    /// never guessed from whatever happens to sit in `project_dir` (a
+    /// stray unrelated clone next to the primary checkout must not
+    /// silently receive the new branch/worktree).
     fn worktree_add(
         &self,
+        primary_checkout: &Path,
         project_dir: &Path,
         branch: &str,
         issue_number: u64,
     ) -> Result<Worktree, VcsError>;
 
     /// Remove a worktree and prune its branch.
-    fn worktree_remove(&self, worktree: &Worktree) -> Result<(), VcsError>;
+    ///
+    /// `primary_checkout` is run from in place of `worktree`, which
+    /// stops being a valid working directory partway through removal —
+    /// see [`worktree_add`](Vcs::worktree_add) on why it must be passed
+    /// in rather than guessed.
+    fn worktree_remove(
+        &self,
+        primary_checkout: &Path,
+        worktree: &Worktree,
+    ) -> Result<(), VcsError>;
 
     /// Commit all pending changes in `worktree_path` with `message`.
     fn commit(

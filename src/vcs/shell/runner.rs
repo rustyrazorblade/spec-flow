@@ -242,14 +242,22 @@ mod tests {
 
     #[test]
     fn process_runner_runs_in_the_requested_directory() {
+        // `ls`/any command trivially "succeeds" regardless of cwd, so
+        // asserting only `is_success()` would pass even if `current_dir`
+        // were never set. Assert on the actual reported directory
+        // instead — canonicalized, since a tempdir path may traverse a
+        // symlink (e.g. macOS's `/tmp` -> `/private/tmp`).
         let dir = tempfile::tempdir().unwrap();
         let runner = ProcessRunner;
 
-        let output = runner
-            .run("sh", &["-c", "printf %s .; ls"], Some(dir.path()))
-            .unwrap();
+        let output = runner.run("pwd", &[], Some(dir.path())).unwrap();
 
         assert!(output.is_success());
+        let reported = std::path::PathBuf::from(output.stdout.trim());
+        assert_eq!(
+            reported.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
     }
 
     #[test]

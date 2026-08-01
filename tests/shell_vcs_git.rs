@@ -103,7 +103,12 @@ fn worktree_add_creates_a_sibling_checkout_on_a_new_branch() {
     let scratch = scratch();
 
     let worktree = vcs()
-        .worktree_add(&scratch.project_dir, "issue-42-widget-cache", 42)
+        .worktree_add(
+            &scratch.checkout,
+            &scratch.project_dir,
+            "issue-42-widget-cache",
+            42,
+        )
         .unwrap();
 
     assert_eq!(worktree.issue_number, 42);
@@ -126,8 +131,14 @@ fn worktree_add_creates_a_sibling_checkout_on_a_new_branch() {
 fn commit_records_pending_changes_in_the_worktree() {
     let scratch = scratch();
     let vcs = vcs();
-    let worktree =
-        vcs.worktree_add(&scratch.project_dir, "issue-42-cache", 42).unwrap();
+    let worktree = vcs
+        .worktree_add(
+            &scratch.checkout,
+            &scratch.project_dir,
+            "issue-42-cache",
+            42,
+        )
+        .unwrap();
     std::fs::write(worktree.path.join("cache.rs"), "// cache\n").unwrap();
 
     vcs.commit(&worktree.path, "issue-42: add the cache").unwrap();
@@ -143,8 +154,14 @@ fn commit_records_pending_changes_in_the_worktree() {
 fn push_publishes_the_branch_to_the_remote() {
     let scratch = scratch();
     let vcs = vcs();
-    let worktree =
-        vcs.worktree_add(&scratch.project_dir, "issue-42-cache", 42).unwrap();
+    let worktree = vcs
+        .worktree_add(
+            &scratch.checkout,
+            &scratch.project_dir,
+            "issue-42-cache",
+            42,
+        )
+        .unwrap();
     std::fs::write(worktree.path.join("cache.rs"), "// cache\n").unwrap();
     vcs.commit(&worktree.path, "issue-42: add the cache").unwrap();
 
@@ -160,10 +177,16 @@ fn push_publishes_the_branch_to_the_remote() {
 fn worktree_remove_deletes_the_checkout_and_its_branch() {
     let scratch = scratch();
     let vcs = vcs();
-    let worktree =
-        vcs.worktree_add(&scratch.project_dir, "issue-42-cache", 42).unwrap();
+    let worktree = vcs
+        .worktree_add(
+            &scratch.checkout,
+            &scratch.project_dir,
+            "issue-42-cache",
+            42,
+        )
+        .unwrap();
 
-    vcs.worktree_remove(&worktree).unwrap();
+    vcs.worktree_remove(&scratch.checkout, &worktree).unwrap();
 
     assert!(!worktree.path.exists());
     assert_eq!(
@@ -182,8 +205,9 @@ fn worktree_remove_deletes_the_checkout_and_its_branch() {
 fn worktree_add_reports_a_container_with_no_checkout() {
     let root = tempfile::tempdir().unwrap();
 
-    let error =
-        vcs().worktree_add(root.path(), "issue-1-nowhere", 1).unwrap_err();
+    let error = vcs()
+        .worktree_add(root.path(), root.path(), "issue-1-nowhere", 1)
+        .unwrap_err();
 
     assert!(matches!(error, spec_flow::VcsError::CommandFailed { .. }));
 }

@@ -93,6 +93,42 @@ pub enum InitError {
         /// The project container directory in question.
         project_dir: PathBuf,
     },
+
+    /// The checkout `init` was run from is not the primary checkout
+    /// §10.1 requires — `<project_dir>/<default_branch>` — whether
+    /// `project_dir` was derived from `repo_dir`'s parent or given
+    /// explicitly via `--project-dir`.
+    #[error(
+        "`{repo_dir}` is not `{project_dir}/{default_branch}` — \
+         spec-flow requires the primary checkout to be \
+         `<project_dir>/<default_branch>` (§10.1). Move or rename this \
+         checkout so its final path component is `{default_branch}` and \
+         its parent is `{project_dir}`, or pass a --project-dir under \
+         which that already holds"
+    )]
+    CheckoutNotSiblingOfDefaultBranch {
+        /// The checkout directory `init` was run against.
+        repo_dir: PathBuf,
+        /// The project container — derived from `repo_dir`'s parent, or
+        /// the `--project-dir` override.
+        project_dir: PathBuf,
+        /// The repo's actual default branch.
+        default_branch: String,
+    },
+
+    /// `path` could not be canonicalized — resolved to an absolute,
+    /// symlink-free form (§10.1's layout check compares canonical
+    /// paths, since a relative `--project-dir` or a symlinked checkout
+    /// must not be spuriously rejected). Most commonly: the path does
+    /// not exist.
+    #[error("could not resolve `{path}` to a canonical path")]
+    UnresolvablePath {
+        /// The path that failed to canonicalize.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Register the repo in the current directory with the daemon and
@@ -107,10 +143,11 @@ pub enum InitError {
 /// [`InitError::Vcs`] when `git`/`gh` are missing or `gh` is not
 /// authenticated for the resolved repo (checked up front, §8.5),
 /// [`InitError::Config`] or [`InitError::Scaffold`] when a file cannot
-/// be written, and [`InitError::CurrentDir`] /
-/// [`InitError::NoProjectDir`] / [`InitError::NoProjectName`] when the
-/// `<project_dir>/<branch>` layout cannot be resolved from where `init`
-/// was run (§10.1).
+/// be written, and [`InitError::CurrentDir`] / [`InitError::NoProjectDir`]
+/// / [`InitError::NoProjectName`] / [`InitError::UnresolvablePath`] /
+/// [`InitError::CheckoutNotSiblingOfDefaultBranch`] when the
+/// `<project_dir>/<default_branch>` layout cannot be resolved from
+/// where `init` was run, or from the given `--project-dir` (§10.1).
 pub fn init<V: Vcs>(vcs: &V, options: InitOptions) -> Result<(), InitError> {
     let repo_dir = std::env::current_dir()
         .map_err(|source| InitError::CurrentDir { source })?;
@@ -134,6 +171,14 @@ fn init_at<V: Vcs>(
     )?;
 
     let mut global_config = load_or_default_global_config(global_config_path)?;
+    // Two different containers can share a basename (`~/work/foo` and
+    // `~/oss/foo` both name a project `foo`) — capture what the
+    // registry pointed at *before* this call so a same-name repoint to
+    // a different directory is surfaced, not silently stolen from
+    // whatever project owned that name before.
+    let previous_project_dir =
+        crate::registry::find_project(&global_config, &project_config.name)
+            .map(|pointer| pointer.project_dir.clone());
     add_project(
         &mut global_config,
         ProjectPointer {
@@ -141,6 +186,18 @@ fn init_at<V: Vcs>(
             project_dir: project_config.project_dir.clone(),
         },
     );
+    if let Some(previous_project_dir) = previous_project_dir
+        && previous_project_dir != project_config.project_dir
+    {
+        tracing::warn!(
+            project = %project_config.name,
+            previous_project_dir = %previous_project_dir.display(),
+            project_dir = %project_config.project_dir.display(),
+            "registry entry repointed to a different directory under the \
+             same project name; the previous directory's project is now \
+             unregistered"
+        );
+    }
     save_global_config(global_config_path, &global_config)?;
 
     scaffold_spec_flow_dir(repo_dir)?;
@@ -171,7 +228,7 @@ fn resolve_project_config<V: Vcs>(
     let default_branch = vcs.detect_default_branch(repo_dir)?;
     let merge_mode = detect_merge_mode(vcs, &repo, &default_branch)?;
 
-    // §10.1: every branch — including the primary checkout `init` is run
+    // Every branch — including the primary checkout `init` is run
     // from — is a sibling *inside* the project container, so the
     // container is the checkout's parent unless the operator says
     // otherwise.
@@ -184,6 +241,41 @@ fn resolve_project_config<V: Vcs>(
             })?
             .to_path_buf(),
     };
+
+    // Canonicalize both sides before comparing (and keep the canonical
+    // `project_dir` for everything below): `repo_dir` is already
+    // absolute (from `std::env::current_dir()`, §10.2) but may still
+    // traverse a symlink (macOS's `/tmp` -> `/private/tmp`), and an
+    // operator-supplied `--project-dir` may be relative (`..`) or itself
+    // symlinked. A purely lexical comparison would spuriously reject
+    // every one of those spellings of an otherwise-correct §10.1
+    // layout — only the one exact absolute string `repo_dir.parent()`
+    // happens to produce would ever pass.
+    let repo_dir_canonical = repo_dir.canonicalize().map_err(|source| {
+        InitError::UnresolvablePath { path: repo_dir.to_path_buf(), source }
+    })?;
+    let project_dir = project_dir.canonicalize().map_err(|source| {
+        InitError::UnresolvablePath { path: project_dir.clone(), source }
+    })?;
+
+    // §10.1: the primary checkout must itself BE `<project_dir>/
+    // <default_branch>` — checked against the resolved `project_dir`
+    // above, whether that came from `repo_dir`'s parent or an explicit
+    // `--project-dir`. A plain `git clone` names its directory after the
+    // repo, not the branch, and an operator-supplied `--project-dir`
+    // that doesn't actually contain this checkout as its
+    // `<default_branch>` sibling is exactly as wrong: either way,
+    // silently proceeding would record a `local_path` that does not
+    // exist on disk, and every later worktree/coordinator operation that
+    // trusts it would inherit the drift.
+    if project_dir.join(&default_branch) != repo_dir_canonical {
+        return Err(InitError::CheckoutNotSiblingOfDefaultBranch {
+            repo_dir: repo_dir.to_path_buf(),
+            project_dir,
+            default_branch,
+        });
+    }
+
     let name = project_dir
         .file_name()
         .ok_or_else(|| InitError::NoProjectName {
@@ -198,7 +290,7 @@ fn resolve_project_config<V: Vcs>(
     // `harnesses.default` (§2.6). Detection can't (re-)produce either,
     // so a re-`init` must carry forward whatever the operator already
     // set on this project rather than wiping it back to `None`.
-    let (gh, harness) = existing_overrides(&project_dir);
+    let (gh, harness) = existing_overrides(&project_dir)?;
 
     Ok(ProjectConfig {
         name,
@@ -217,15 +309,33 @@ fn resolve_project_config<V: Vcs>(
 /// The `gh`/`harness` overrides already recorded in
 /// `<project_dir>/config.yaml`, if a config is there to read.
 ///
-/// Absent on a fresh `init` (no file yet) and on any read failure — a
-/// corrupt or unreadable existing file is not this function's problem
-/// to raise; it simply means there is nothing to carry forward.
+/// Absent only on a fresh `init` (no file yet) — anything else that
+/// keeps the file from being read is a hard error, not "nothing to
+/// carry forward"; see the `# Errors` section below.
+///
+/// # Errors
+///
+/// Propagates any [`ConfigError`] other than "the file does not exist
+/// yet" — a fresh `init` has nothing to carry forward, but a file that
+/// exists and fails to parse (a hand-edit gone wrong) or fails to read
+/// (a permissions problem) is NOT "nothing to carry forward": `init_at`
+/// is about to overwrite this file, and warning-then-proceeding would
+/// still destroy the operator's `gh`/`harness` overrides the moment it
+/// printed the warning — exactly the clobber this function exists to
+/// prevent. A hard failure here tells the operator to fix or remove the
+/// file before re-running `init`, rather than `init` silently
+/// regenerating over it.
 fn existing_overrides(
     project_dir: &Path,
-) -> (Option<GhConfig>, Option<String>) {
+) -> Result<(Option<GhConfig>, Option<String>), ConfigError> {
     match load_project_config(&project_config_path(project_dir)) {
-        Ok(existing) => (existing.gh, existing.harness),
-        Err(_) => (None, None),
+        Ok(existing) => Ok((existing.gh, existing.harness)),
+        Err(ConfigError::Read { ref source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok((None, None))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -336,6 +446,13 @@ mod tests {
             let project_dir = root.path().join("repo-a");
             let repo_dir = project_dir.join("main");
             fs::create_dir_all(&repo_dir).unwrap();
+            // Canonicalize once, here, so every seeded FakeVcs lookup and
+            // every assertion in this module compares against the same
+            // resolved form `resolve_project_config` itself compares
+            // against (§10.1's layout check canonicalizes both sides —
+            // see `fails_when...` tests below for why that matters).
+            let project_dir = project_dir.canonicalize().unwrap();
+            let repo_dir = repo_dir.canonicalize().unwrap();
 
             let vcs = FakeVcs::new();
             vcs.authenticated.borrow_mut().insert(REPO.to_string());
@@ -525,6 +642,202 @@ mod tests {
     }
 
     #[test]
+    fn fails_when_the_checkout_is_not_named_for_the_default_branch() {
+        let root = TempDir::new().unwrap();
+        let project_dir = root.path().join("repo-a");
+        // Named after the repo, the way a plain `git clone` would name
+        // it — NOT after the default branch, so it cannot be the
+        // primary checkout §10.1 requires.
+        let repo_dir = project_dir.join("repo-a");
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        let vcs = FakeVcs::new();
+        vcs.authenticated.borrow_mut().insert(REPO.to_string());
+        vcs.repo_slugs.borrow_mut().insert(repo_dir.clone(), REPO.to_string());
+        vcs.default_branches
+            .borrow_mut()
+            .insert(repo_dir.clone(), "main".to_string());
+        vcs.merge_queue_enabled_repos.borrow_mut().insert(REPO.to_string());
+        let global_config_path =
+            root.path().join("home/.config/spec-flow/config.yaml");
+
+        let error = init_at(
+            &vcs,
+            &InitOptions::default(),
+            &repo_dir,
+            &global_config_path,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            InitError::CheckoutNotSiblingOfDefaultBranch { .. }
+        ));
+        // Nothing was written: a rejected init must not leave a
+        // half-written project config behind.
+        assert!(!project_config_path(&project_dir).exists());
+    }
+
+    #[test]
+    fn fails_when_project_dir_override_does_not_actually_contain_the_checkout()
+    {
+        // The checkout IS correctly named `main`, and the override
+        // exists on disk, but it doesn't actually have the checkout as
+        // its `main` sibling — exactly as wrong as a misnamed checkout
+        // (§10.1), and must not be accepted just because it was
+        // explicit.
+        let root = TempDir::new().unwrap();
+        let real_project_dir = root.path().join("repo-a");
+        let repo_dir = real_project_dir.join("main");
+        fs::create_dir_all(&repo_dir).unwrap();
+        let wrong_project_dir = root.path().join("somewhere-else");
+        fs::create_dir_all(&wrong_project_dir).unwrap();
+
+        let vcs = seeded_vcs(&repo_dir, REPO);
+        let global_config_path =
+            root.path().join("home/.config/spec-flow/config.yaml");
+
+        let error = init_at(
+            &vcs,
+            &InitOptions {
+                repo: None,
+                project_dir: Some(wrong_project_dir.clone()),
+            },
+            &repo_dir,
+            &global_config_path,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            InitError::CheckoutNotSiblingOfDefaultBranch { .. }
+        ));
+        assert!(!project_config_path(&wrong_project_dir).exists());
+        assert!(!project_config_path(&real_project_dir).exists());
+    }
+
+    #[test]
+    fn fails_when_project_dir_override_does_not_exist() {
+        let root = TempDir::new().unwrap();
+        let project_dir = root.path().join("repo-a");
+        let repo_dir = project_dir.join("main");
+        fs::create_dir_all(&repo_dir).unwrap();
+        let nonexistent = root.path().join("never-created");
+
+        let vcs = seeded_vcs(&repo_dir, REPO);
+        let global_config_path =
+            root.path().join("home/.config/spec-flow/config.yaml");
+
+        let error = init_at(
+            &vcs,
+            &InitOptions { repo: None, project_dir: Some(nonexistent) },
+            &repo_dir,
+            &global_config_path,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, InitError::UnresolvablePath { .. }));
+    }
+
+    #[test]
+    fn accepts_a_relative_project_dir_override_that_resolves_to_the_true_parent()
+     {
+        // A relative override (`..`) or one that traverses a symlink
+        // must be accepted when it genuinely resolves to the checkout's
+        // real parent — the §10.1 layout check compares canonical
+        // paths precisely so spellings like this aren't spuriously
+        // rejected.
+        let root = TempDir::new().unwrap();
+        let project_dir = root.path().join("repo-a");
+        let repo_dir = project_dir.join("main");
+        fs::create_dir_all(&repo_dir).unwrap();
+        let project_dir = project_dir.canonicalize().unwrap();
+        let repo_dir = repo_dir.canonicalize().unwrap();
+
+        let vcs = seeded_vcs(&repo_dir, REPO);
+        let global_config_path =
+            root.path().join("home/.config/spec-flow/config.yaml");
+
+        init_at(
+            &vcs,
+            &InitOptions {
+                repo: None,
+                project_dir: Some(repo_dir.join("..")),
+            },
+            &repo_dir,
+            &global_config_path,
+        )
+        .unwrap();
+
+        let config =
+            load_project_config(&project_config_path(&project_dir)).unwrap();
+        assert_eq!(config.project_dir, project_dir);
+    }
+
+    /// A [`FakeVcs`] authenticated + ready for `repo_dir`/`repo`, with
+    /// `main` as the default branch and the native merge queue on.
+    fn seeded_vcs(repo_dir: &Path, repo: &str) -> FakeVcs {
+        let vcs = FakeVcs::new();
+        vcs.authenticated.borrow_mut().insert(repo.to_string());
+        vcs.repo_slugs
+            .borrow_mut()
+            .insert(repo_dir.to_path_buf(), repo.to_string());
+        vcs.default_branches
+            .borrow_mut()
+            .insert(repo_dir.to_path_buf(), "main".to_string());
+        vcs.merge_queue_enabled_repos.borrow_mut().insert(repo.to_string());
+        vcs
+    }
+
+    #[test]
+    fn repointing_a_project_name_to_a_different_directory_still_succeeds() {
+        // Two unrelated containers that happen to share a basename
+        // (`repo-a`) — `init`'s derived project *name* collides even
+        // though the projects are unrelated.
+        let root = TempDir::new().unwrap();
+        let global_config_path =
+            root.path().join("home/.config/spec-flow/config.yaml");
+
+        let work_project_dir = root.path().join("work/repo-a");
+        let work_repo_dir = work_project_dir.join("main");
+        fs::create_dir_all(&work_repo_dir).unwrap();
+        let work_vcs = seeded_vcs(&work_repo_dir, "owner/work-repo-a");
+        init_at(
+            &work_vcs,
+            &InitOptions::default(),
+            &work_repo_dir,
+            &global_config_path,
+        )
+        .unwrap();
+
+        let oss_project_dir = root.path().join("oss/repo-a");
+        let oss_repo_dir = oss_project_dir.join("main");
+        fs::create_dir_all(&oss_repo_dir).unwrap();
+        // Canonicalize before asserting below — `resolve_project_config`
+        // records the canonical form (§10.1's layout check compares
+        // canonical paths), and this container may sit under a
+        // symlinked temp dir (e.g. macOS's `/tmp` -> `/private/tmp`).
+        let oss_project_dir = oss_project_dir.canonicalize().unwrap();
+        let oss_repo_dir = oss_repo_dir.canonicalize().unwrap();
+        let oss_vcs = seeded_vcs(&oss_repo_dir, "owner/oss-repo-a");
+
+        // Must succeed (never a hard failure) — repointing a name is
+        // surfaced via a warning (not asserted here; this crate has no
+        // test-subscriber capture yet), not blocked.
+        init_at(
+            &oss_vcs,
+            &InitOptions::default(),
+            &oss_repo_dir,
+            &global_config_path,
+        )
+        .unwrap();
+
+        let global = load_global_config(&global_config_path).unwrap();
+        assert_eq!(global.projects.len(), 1);
+        assert_eq!(global.projects[0].project_dir, oss_project_dir);
+    }
+
+    #[test]
     fn honors_the_repo_override_instead_of_detecting() {
         let fixture = Fixture::new();
         fixture.vcs.repo_slugs.borrow_mut().clear();
@@ -565,5 +878,34 @@ mod tests {
         let reloaded = fixture.project_config();
         assert_eq!(reloaded.gh, edited.gh);
         assert_eq!(reloaded.harness, edited.harness);
+    }
+
+    #[test]
+    fn re_running_init_over_an_unparseable_existing_config_fails_loudly() {
+        let fixture = Fixture::new();
+        fixture.init().unwrap();
+        // A hand-edit gone wrong — not "no file yet" (which has nothing
+        // to carry forward) but a real read failure. `init` is about to
+        // overwrite this file, so silently proceeding with `(None,
+        // None)` would destroy whatever `gh`/`harness` overrides it held
+        // the moment it printed a warning. It must fail loudly instead,
+        // and must not touch the file first.
+        write_file(
+            &project_config_path(&fixture.project_dir),
+            "gh: [this is not a project config\n",
+        );
+
+        assert!(matches!(
+            fixture.init(),
+            Err(InitError::Config(ConfigError::Parse { .. }))
+        ));
+
+        // Untouched: a rejected re-init must not overwrite the file it
+        // couldn't safely read from.
+        assert_eq!(
+            fs::read_to_string(project_config_path(&fixture.project_dir))
+                .unwrap(),
+            "gh: [this is not a project config\n"
+        );
     }
 }

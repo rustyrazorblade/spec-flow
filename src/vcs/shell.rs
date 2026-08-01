@@ -24,7 +24,7 @@
 
 mod runner;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -36,7 +36,7 @@ use self::runner::{
 };
 use super::{
     IssueRef, IssueRelationships, IssueState, PullRequestRef, Vcs, VcsError,
-    Worktree,
+    Worktree, branch_slug,
 };
 
 /// The `gh issue view` fields [`Vcs::read_issue`] requests, in the order
@@ -185,43 +185,6 @@ impl ShellVcs {
                 Err(VcsError::BinaryNotFound { binary: binary.to_string() })
             }
         }
-    }
-
-    /// The checkout inside `project_dir` to run `git worktree` from.
-    ///
-    /// §10.1 makes the project container hold every checkout as a
-    /// sibling, so the container itself is not a repository and cannot
-    /// be a `git worktree` working directory. The primary checkout is
-    /// the sibling whose `.git` is a *directory*; a linked worktree
-    /// carries a `.git` file instead. When no sibling qualifies this
-    /// falls back to `project_dir`, so the caller gets `git`'s own
-    /// "not a git repository" diagnostic instead of a guess.
-    fn primary_checkout(project_dir: &Path) -> PathBuf {
-        let Ok(entries) = std::fs::read_dir(project_dir) else {
-            return project_dir.to_path_buf();
-        };
-        let mut checkouts: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.join(".git").is_dir())
-            .collect();
-        // Sorted so a container holding several checkouts always picks
-        // the same one, rather than whatever order the filesystem gave.
-        checkouts.sort();
-        checkouts
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| project_dir.to_path_buf())
-    }
-
-    /// The short slug embedded in `branch` (`widget-cache` in
-    /// `issue-42-widget-cache`), or the whole branch when it does not
-    /// carry the conventional prefix.
-    fn branch_slug(branch: &str, issue_number: u64) -> String {
-        branch
-            .strip_prefix(&format!("issue-{issue_number}-"))
-            .unwrap_or(branch)
-            .to_string()
     }
 
     /// Parse `Depends on #N` edges out of an issue body (§8.4).
@@ -381,41 +344,39 @@ impl Vcs for ShellVcs {
 
     fn worktree_add(
         &self,
+        primary_checkout: &Path,
         project_dir: &Path,
         branch: &str,
         issue_number: u64,
     ) -> Result<Worktree, VcsError> {
         let path = project_dir.join(branch);
-        let checkout = ShellVcs::primary_checkout(project_dir);
         let path_arg = path.to_string_lossy().into_owned();
 
         self.run_checked(
             &self.git_binary,
             &["worktree", "add", "-b", branch, &path_arg],
-            Some(&checkout),
+            Some(primary_checkout),
         )?;
 
         Ok(Worktree {
             issue_number,
             path,
             branch: branch.to_string(),
-            slug: ShellVcs::branch_slug(branch, issue_number),
+            slug: branch_slug(branch, issue_number),
         })
     }
 
-    fn worktree_remove(&self, worktree: &Worktree) -> Result<(), VcsError> {
-        // Run from a *sibling* checkout: the worktree being removed
-        // stops being a valid working directory partway through.
-        let checkout = worktree
-            .path
-            .parent()
-            .map_or_else(|| worktree.path.clone(), ShellVcs::primary_checkout);
+    fn worktree_remove(
+        &self,
+        primary_checkout: &Path,
+        worktree: &Worktree,
+    ) -> Result<(), VcsError> {
         let path_arg = worktree.path.to_string_lossy().into_owned();
 
         self.run_checked(
             &self.git_binary,
             &["worktree", "remove", &path_arg],
-            Some(&checkout),
+            Some(primary_checkout),
         )?;
 
         // `--force` because a squash-merged branch is not "merged" as
@@ -427,7 +388,7 @@ impl Vcs for ShellVcs {
         if let Err(error) = self.run_checked(
             &self.git_binary,
             &["branch", "--delete", "--force", &worktree.branch],
-            Some(&checkout),
+            Some(primary_checkout),
         ) {
             warn!(
                 branch = worktree.branch,
@@ -1223,11 +1184,8 @@ mod tests {
 
     #[test]
     fn branch_slug_strips_the_issue_prefix() {
-        assert_eq!(
-            ShellVcs::branch_slug("issue-42-widget-cache", 42),
-            "widget-cache"
-        );
-        assert_eq!(ShellVcs::branch_slug("hotfix", 42), "hotfix");
+        assert_eq!(branch_slug("issue-42-widget-cache", 42), "widget-cache");
+        assert_eq!(branch_slug("hotfix", 42), "hotfix");
     }
 
     #[test]

@@ -465,32 +465,26 @@ mod tests {
 
     #[test]
     fn global_config_round_trips_through_yaml() {
-        let dir = std::env::temp_dir()
-            .join(format!("spec-flow-config-test-{}", std::process::id()));
-        let path = dir.join("config.yaml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
         let config = sample_global_config();
 
         save_global_config(&path, &config).unwrap();
         let loaded = load_global_config(&path).unwrap();
 
         assert_eq!(loaded, config);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn project_config_round_trips_through_yaml() {
-        let dir = std::env::temp_dir().join(format!(
-            "spec-flow-project-config-test-{}",
-            std::process::id()
-        ));
-        let path = dir.join("config.yaml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
         let config = sample_project_config();
 
         save_project_config(&path, &config).unwrap();
         let loaded = load_project_config(&path).unwrap();
 
         assert_eq!(loaded, config);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
