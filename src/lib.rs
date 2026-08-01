@@ -38,30 +38,33 @@ callers write `spec_flow::GlobalConfig`, not
 | `claim.rs` | Work-claiming (§8.2, §14 step 5): [`write_claim`]/[`confirm_claim`], the two-step optimistic claim + settle-read; heartbeat refresh and an instance's own stale-claim reclaim are just `write_claim` called again | Implemented (step 5) against the [`Vcs`] trait's existing `read_issue`/`set_label` — no new `Vcs` method was needed. Staleness itself is [`state::drift::find_stale_claims`]'s job, not this module's. **Unresolved architectural conflict, confirmed not just suspected** (see `vcs::shell::ShellVcs::set_label`'s doc): `gh issue edit --add-label` cannot add a label name that doesn't already exist in the repo, but every `write_claim` heartbeat mints a brand-new `owner:<instance>@<epoch>` label name — the claim protocol as specified (§8.2) cannot work against real GitHub through this transport as shipped. Needs a design decision before `serve` (§14 step 6+) relies on it. |
 | `schedule.rs` | The scheduler's default ordering (§12, §14 step 5): the pure [`schedule::next_action`]/[`schedule::schedule_order`] functions (actionable-now → furthest-along → priority → age) | Implemented (step 5) over the shipped-default [`schedule::DEFAULT_PHASE_ORDER`] (§7.2) — see its module doc for what's deferred: a workflow-config-defined phase order, a "dependency" tie-break ahead of age, and the CI/PR poller's backoff loop (all §14 step 6+ or later). |
 | `workflow/` | The workflow-config data model + parser (§7, §14 step 7): [`workflow::WorkflowConfig`] and its nested types, deserialized straight from `scaffold::DEFAULT_WORKFLOW_YAML`; gate evaluation ([`workflow::gate_clear`] and friends, §2.3b/§4.3); `requires` evaluation ([`workflow::requirement_satisfied`], §7.1); the review-panel/bounded-fix-loop decision primitive ([`workflow::evaluate_panel`], §7.1); and `advance`/`approve`/`set_gate` as plain, pure functions (§6) | Implemented (step 7) as pure data + pure functions only — see the module's own doc for exactly what is and is not covered; no phase engine, spawner wiring, or MCP server calls any of it yet. |
+| `merge.rs` | Merge-queue integration (§8.1, §14 step 8): [`merge::plan_merge`] (gate → enqueue, native mode) and [`merge::observe_merge`] (observe) as pure functions | Implemented (step 8) for the **native** merge queue only — see the module's own doc for why the serialized fallback (§8.1's warn-and-degrade path) is a documented, deliberately unresolved gap rather than a guess: it hinges on §8.3's lease model, itself an open question (§16 item 5). `init`'s merge-queue-enabled check (this step's other named deliverable) was already implemented in step 1 (`init::detect_merge_mode`); nothing changed there. |
 | `main.rs` (binary, not part of this library) | `clap` CLI wiring, `tracing` setup, `anyhow` error reporting at the top level | `init` is fully wired (step 1); the `serve` subcommand (the MCP server itself) is a stub — out of scope until spec §14 step 6+. |
 
 # What is deliberately *not* here yet
 
-This crate currently covers §14 steps 1–7 (registry/config, the git/gh
+This crate currently covers §14 steps 1–8 (registry/config, the git/gh
 layer, `init`, the process spawner, the GitHub-state layer,
 work-claiming and the scheduler's ordering, the instruction composer's
-pure mechanism, and now the workflow-config parser plus the phase
-engine's pure decision logic) plus the step-2 spike recorded in
-`docs/memory-index-spike.md` (no code needed there). It still has no
-async runtime, no MCP crate, and no actual phase engine wiring — those
-are steps 8+. In particular, step 5 stops short of an actual polling
-loop: the `schedule` module's doc records why a CI/PR poller's backoff
-timer is out of scope until an async runtime exists. Step 6 stops short
-of authoring every injection point's real base-template content
-(`instructions.rs`'s and `scaffold.rs`'s docs record exactly which two
-points do, and which the rest still don't) and short of wiring the
-composer into anything, since there is nothing to wire it into yet.
-Step 7 (`workflow/`) stops short of actually spawning anything: it
-computes what should happen next, never causes it to happen — see
-`workflow`'s own module doc for the precise boundary, including the
-unmodeled `deny` re-entry routing and the not-yet-implemented `workflows:`
-map (§7.4's multiple-named-workflows extension point). When the MCP
-server itself is built (step 8+), the official Rust SDK is
+pure mechanism, the workflow-config parser plus the phase engine's pure
+decision logic, and now native merge-queue integration) plus the step-2
+spike recorded in `docs/memory-index-spike.md` (no code needed there).
+It still has no async runtime, no MCP crate, and no actual phase engine
+wiring — those are steps 9+. In particular, step 5 stops short of an
+actual polling loop: the `schedule` module's doc records why a CI/PR
+poller's backoff timer is out of scope until an async runtime exists.
+Step 6 stops short of authoring every injection point's real
+base-template content (`instructions.rs`'s and `scaffold.rs`'s docs
+record exactly which two points do, and which the rest still don't) and
+short of wiring the composer into anything, since there is nothing to
+wire it into yet. Step 7 (`workflow/`) stops short of actually spawning
+anything: it computes what should happen next, never causes it to
+happen — see `workflow`'s own module doc for the precise boundary,
+including the unmodeled `deny` re-entry routing and the
+not-yet-implemented `workflows:` map (§7.4's multiple-named-workflows
+extension point). Step 8 (`merge.rs`) stops short of the serialized
+merge-lease fallback — see that module's doc for exactly why. When the
+MCP server itself is built (step 9+), the official Rust SDK is
 [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk); pull it in
 (with `tokio`) at that point, not before.
 */
@@ -79,6 +82,9 @@ pub use crate::instructions::{
     InstructionError, VAR_BRANCH, VAR_DEFAULT_BRANCH, VAR_ISSUE_NUMBER,
     VAR_SPECS_DIR, VAR_WORKTREE_PATH, compose, interpolate,
     read_instruction_override,
+};
+pub use crate::merge::{
+    MergeAction, MergeObservation, observe_merge, plan_merge,
 };
 pub use crate::registry::{
     AddOutcome, add_project, find_project, find_project_containing,
@@ -122,6 +128,7 @@ mod claim;
 mod config;
 mod init;
 mod instructions;
+mod merge;
 mod registry;
 mod scaffold;
 mod schedule;

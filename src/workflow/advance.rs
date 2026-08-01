@@ -60,7 +60,10 @@ const READY_STATUS: &str = "ready";
 /// `advance_into` call it; the still-nonexistent phase engine that will
 /// actually execute `merge_queue` (§14 step 7+) will need the same
 /// check too, but widening this function's visibility can wait until
-/// that caller exists.
+/// that caller exists. When it does, `crate::merge`'s `plan_merge`/
+/// `observe_merge` (§14 step 8) are the pure decision functions that
+/// pick up once this identifies `review` as the phase to run them
+/// against.
 pub(super) fn is_merge_gate(phase: &Phase) -> bool {
     matches!(&phase.action, PhaseAction::Server { op } if op == "merge_queue")
 }
