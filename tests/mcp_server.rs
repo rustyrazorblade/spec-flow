@@ -33,13 +33,17 @@
 //! authenticated repo, which is not a unit-test dependency this crate
 //! takes anywhere else.
 //!
-//! That applies to the two **write** tools (§6's `approve`/`set_gate`)
-//! as well, and is if anything safer there: a `gh` binary that cannot
-//! be executed means no label and no comment can reach a real repo from
-//! a test run. What these prove for them is the same request path plus
-//! the ordering that matters — a rejected argument (an unknown `phase`,
-//! a `decision`/`mode` outside its enum) fails *before* the `gh` layer
-//! is reached at all, so a bad call writes nothing.
+//! That applies to the three **write** tools (§6's `approve`/`set_gate`
+//! pair, plus `advance`) as well, and is if anything safer there: a `gh`
+//! binary that cannot be executed means no label and no comment can
+//! reach a real repo from a test run. What these prove for them is the
+//! same request path plus the ordering that matters — a rejected
+//! argument (an unknown `phase`, a `decision`/`mode` outside its enum)
+//! and an unreadable workflow file both fail *before* the `gh` layer is
+//! reached at all, so such a call writes nothing. `advance` takes no
+//! argument that can be rejected on its own (just an issue number), so
+//! for it that ordering is pinned through the workflow-file read
+//! instead.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -255,16 +259,17 @@ async fn the_server_advertises_exactly_this_slices_tools() {
     names.sort();
 
     // Pinned deliberately: §6 lists ~24 tools, and this server ships
-    // seven -- every read-only tool under §6's "Board / status"
+    // eight -- every read-only tool under §6's "Board / status"
     // heading, plus `register`, plus §6's "Approval & gates" write
-    // pair. An eighth appearing here without a matching doc update in
-    // `src/server/mod.rs`'s "what this server deliberately does not
-    // implement" list is exactly the drift worth failing on.
+    // pair, plus `advance`. A ninth appearing here without a matching
+    // doc update in `src/server/mod.rs`'s "what this server
+    // deliberately does not implement" list is exactly the drift worth
+    // failing on.
     assert_eq!(
         names,
         vec![
-            "approve", "backlog", "board", "drift", "issue", "register",
-            "set_gate"
+            "advance", "approve", "backlog", "board", "drift", "issue",
+            "register", "set_gate"
         ]
     );
 
@@ -1061,6 +1066,146 @@ async fn set_gate_reaches_the_git_gh_layer_once_the_connection_is_bound() {
         error_message(&error).contains("spec-flow-no-such-gh-binary"),
         "the failure must be the gh call, not a wiring mistake: {}",
         error_message(&error)
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn advance_refuses_an_unregistered_connection() {
+    // §15's "project rides the connection", with a write tool's stakes:
+    // without a binding there is no repo whose issue could be moved.
+    let addr = spawn_server(global_config(Vec::new())).await;
+    let client = connect(addr).await;
+
+    let error = client
+        .call_tool(call("advance", serde_json::json!({ "issue_number": 1 })))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error_code(&error), ErrorCode::INVALID_REQUEST);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn advance_reaches_the_git_gh_layer_once_the_connection_is_bound() {
+    // The workflow file parsed (that read happens first); the only thing
+    // left failing is the deliberately-missing `gh` -- i.e. the issue
+    // really is read from GitHub before any decision is made (§2.3),
+    // rather than the tool answering from anything local.
+    let tmp = tempfile::tempdir().unwrap();
+    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    scaffold_workflow(tmp.path());
+    let addr = spawn_server(global_config(vec![pointer])).await;
+    let client = connect(addr).await;
+
+    client
+        .call_tool(call(
+            "register",
+            serde_json::json!({
+                "worker_ref": "w",
+                "role": "coordinator",
+                "cwd": tmp.path().to_str().unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let error = client
+        .call_tool(call("advance", serde_json::json!({ "issue_number": 42 })))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error_code(&error), ErrorCode::INTERNAL_ERROR);
+    assert!(
+        error_message(&error).contains("spec-flow-no-such-gh-binary"),
+        "the failure must be the gh call, not the workflow read: {}",
+        error_message(&error)
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn advance_names_the_workflow_file_it_could_not_read() {
+    // `advance` has no argument that can be wrong on its own -- an issue
+    // number is an issue number -- so this is the test that pins the
+    // *ordering* the `approve`/`set_gate` argument-rejection tests pin
+    // for them: the project's phase sequence is read and parsed before
+    // any `gh` call, so a project whose checkout lacks
+    // `.spec-flow/workflow.yaml` fails naming that file and cannot have
+    // written a half-applied status transition on the way.
+    let tmp = tempfile::tempdir().unwrap();
+    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer])).await;
+    let client = connect(addr).await;
+
+    client
+        .call_tool(call(
+            "register",
+            serde_json::json!({
+                "worker_ref": "w",
+                "role": "coordinator",
+                "cwd": tmp.path().to_str().unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let error = client
+        .call_tool(call("advance", serde_json::json!({ "issue_number": 42 })))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error_code(&error), ErrorCode::INTERNAL_ERROR);
+    let message = error_message(&error);
+    assert!(
+        message.contains(".spec-flow/workflow.yaml"),
+        "the failure must name the missing file: {message}"
+    );
+    assert!(
+        !message.contains("spec-flow-no-such-gh-binary"),
+        "the workflow must be read before any gh call: {message}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn advance_rejects_a_missing_issue_number_argument() {
+    // Same shape as `issue`'s own missing-argument test: `rmcp` reports
+    // a parameter-decoding failure as a successful call carrying
+    // `isError: true`, not as a JSON-RPC error. Pinned so `issue_number`
+    // can never quietly acquire a default and move issue #0.
+    let tmp = tempfile::tempdir().unwrap();
+    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    scaffold_workflow(tmp.path());
+    let addr = spawn_server(global_config(vec![pointer])).await;
+    let client = connect(addr).await;
+
+    client
+        .call_tool(call(
+            "register",
+            serde_json::json!({
+                "worker_ref": "w",
+                "role": "coordinator",
+                "cwd": tmp.path().to_str().unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let result = client
+        .call_tool(call("advance", serde_json::json!({})))
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        format!("{:?}", result.content).contains("issue_number"),
+        "the failure should name the missing field: {:?}",
+        result.content
     );
 
     client.cancel().await.unwrap();

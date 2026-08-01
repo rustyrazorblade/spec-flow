@@ -4,16 +4,18 @@ This is §6's tool surface as far as it is built: the async foundation
 (`tokio` + `rmcp` over streamable HTTP/SSE, loopback), plus **every
 read-only tool under §6's "Board / status" heading** — `register`,
 `board`, `issue`, `backlog`, and `drift`, all of which re-derive their
-answer from GitHub on every call (§2.3) and write nothing — plus the
-**first two write-path tools, §6's "Approval & gates" pair**:
+answer from GitHub on every call (§2.3) and write nothing — plus three
+write-path tools: §6's "Approval & gates" pair,
 [`approve`](SpecFlowServer::approve) and
-[`set_gate`](SpecFlowServer::set_gate). Both write the GitHub label
+[`set_gate`](SpecFlowServer::set_gate), and §6's
+[`advance`](SpecFlowServer::advance). All three write the GitHub labels
 their decision means before returning (§6, §15), then re-read the issue
 so what they return is GitHub's answer rather than an assumption about
 the write.
 
-`approve`'s **deny** closes half of its §6 contract, on purpose — see
-"What this server deliberately does not implement" below.
+`approve`'s **deny** and `advance`'s **advancing path** each close only
+part of their §6 contract, on purpose — see "What this server
+deliberately does not implement" below.
 
 # The connection *is* the project (§2.5, §6, §15)
 
@@ -58,15 +60,54 @@ step that needs it.
 # What this server deliberately does not implement
 
 Not stubs — absent, and listed here so nobody has to grep for them. Every
-write-path §6 tool except the "Approval & gates" pair:
+write-path §6 tool except the "Approval & gates" pair and `advance`:
 `start_implement`, `submit_artifact`, `submit_review`, `create_issue`,
-`advance`, `cancel_work`, `sync_ci`, `address`, `link`, `unlink`,
+`cancel_work`, `sync_ci`, `address`, `link`, `unlink`,
 `acquire_lease`/`heartbeat_lease`/`release_lease`/`lease_status`,
 `report`, and `instructions`. `init` stays a CLI subcommand here rather
 than an MCP tool (§14.1 ships it as one); wiring it as a tool too is a
 later decision, not an omission with a workaround.
 
 Also absent, and each for a stated reason:
+
+- **`advance`'s execution of the phase it advances *into*** (§6, §7.1) —
+  the second of the two *half*-built things here, and the gap to read
+  before touching that tool. §6 calls `advance` a "manual/coordinator
+  override of the state machine", and this implements the state machine
+  part in full: it evaluates [`crate::advance`]'s decision against the
+  project's own workflow, stops at a `human` gate, passes an `auto` one,
+  blocks on unmet `requires`, and on a clear path **writes the
+  `status:<phase>` label transition** — add the target's, remove the
+  previous one, then re-read. What it does **not** do is run the target
+  phase's `action`. Nothing is spawned for an `agent`/`server_then_agent`
+  target; **no merge is enqueued** when the target is the merge gate,
+  even though [`crate::plan_merge`] already exists as a pure function
+  that would decide it; no `finalize` cleanup (worktree/branch pruning,
+  label dropping, closing the issue) happens — none of that mechanism
+  exists in this crate at all. This is one uniform line, deliberately
+  drawn the same way for every phase type rather than made an exception
+  for the merge gate: "this server moves labels; the phase engine runs
+  phases." A merge-shaped exception would be a partial execution model
+  where some phases run and some do not with nothing in the tool surface
+  saying which — and §2.3b's one safety invariant (nothing merges to the
+  default branch by accident) makes that the worst possible place to
+  start. [`wire::AdvanceResult::action_executed`] is always `false` so
+  no client can read a moved status label as "the phase ran", the same
+  way [`wire::ApproveResult::reentry_triggered`] handles `approve`'s gap.
+
+- **Any roborev verdict at all, for `advance`'s `requires` evaluation**
+  (§12, §7.2 ph.7). §12 is explicit that "**roborev** (which it can't
+  derive) is `report`ed by an agent", and §6's `report` tool is on the
+  absent list above; no label, comment convention, or [`crate::Vcs`]
+  method anywhere in this crate carries one either. So `advance` passes
+  `roborev_verdict: None` and any phase requiring `{roborev: ...}`
+  reports that requirement in its `unmet` list rather than having it
+  silently pass. The visible consequence, stated plainly because it is
+  not small: the shipped default's `review` phase requires `{roborev:
+  clean}`, so **this tool currently cannot move an issue into `review`
+  on the shipped default**, however green CI is. That is the honest
+  state of the system until a `report` tool exists, not something to
+  paper over with a default verdict.
 
 - **`approve(deny)`'s re-entry routing** (§6) — the one *half*-built
   thing here, and the gap to read before touching this tool. §6's deny
@@ -169,13 +210,17 @@ Also absent, and each for a stated reason:
   Neither fix (§2.3/§5's disposable local cache, or a batched GraphQL
   read) is tuning that belongs in a read-only slice.
   Nor is the workflow file [`backlog`](SpecFlowServer::backlog),
-  [`approve`](SpecFlowServer::approve) and
-  [`set_gate`](SpecFlowServer::set_gate) each parse per call cached —
+  [`approve`](SpecFlowServer::approve),
+  [`set_gate`](SpecFlowServer::set_gate) and
+  [`advance`](SpecFlowServer::advance) each parse per call cached —
   see `logic`'s `load_workflow` for why re-reading a file a team edits
   mid-session is the point, not an oversight. `approve` and `set_gate`
   are single-issue calls with no open-issue fan-out at all: one or two
   `gh` invocations for the write, plus [`logic::read_issue`]'s usual
-  three-to-four for the re-read.
+  three-to-four for the re-read. `advance` is the most expensive of the
+  three and still bounded the same way: that read, one `gh issue view`
+  per `blockedBy` dependency, and — only when it actually advances — one
+  or two label writes and a second full re-read.
 */
 
 mod logic;
@@ -200,15 +245,17 @@ use crate::config::{GlobalConfig, ProjectConfig};
 use crate::vcs::ShellVcs;
 
 pub use self::logic::{
-    ApproveOutcome, ClaimHolder, DriftReport, SetGateOutcome, ToolError,
+    AdvanceOutcome, ApproveOutcome, ClaimHolder, DriftReport, SetGateOutcome,
+    ToolError,
 };
 pub use self::wire::{
-    ApproveArgs, ApproveDecisionWire, ApproveResult, BacklogArgs,
-    BacklogResult, BacklogRowWire, BoardArgs, BoardResult, BoardRowWire,
-    CiConclusionWire, ClaimHolderWire, ClaimWire, DriftFindingWire,
-    DriftResult, GateModeWire, IssueArgs, IssueResult, IssueStateWire,
-    PriorityWire, PullRequestStateWire, PullRequestStatusWire, RegisterArgs,
-    RegisterResult, RelationshipsWire, SetGateArgs, SetGateResult,
+    AdvanceArgs, AdvanceDecisionWire, AdvanceResult, ApproveArgs,
+    ApproveDecisionWire, ApproveResult, BacklogArgs, BacklogResult,
+    BacklogRowWire, BoardArgs, BoardResult, BoardRowWire, CiConclusionWire,
+    ClaimHolderWire, ClaimWire, DriftFindingWire, DriftResult, GateModeWire,
+    IssueArgs, IssueResult, IssueStateWire, PriorityWire,
+    PullRequestStateWire, PullRequestStatusWire, RegisterArgs, RegisterResult,
+    RelationshipsWire, RequirementWire, SetGateArgs, SetGateResult,
 };
 
 /// The HTTP path the MCP endpoint is mounted at.
@@ -463,6 +510,32 @@ impl SpecFlowServer {
         self.set_gate_inner(args).await.map(Json).map_err(tool_error)
     }
 
+    /// `advance(issue_number)` (§6) — the manual/coordinator override of
+    /// the state machine: stop at a `human` gate, pass an `auto` gate,
+    /// block on unmet `requires`, and otherwise write the issue's
+    /// `status:<phase>` transition through to GitHub (§15).
+    ///
+    /// Two halves of §7.1's engine are deliberately **not** here: the
+    /// target phase's action never runs (no spawn, no merge enqueue, no
+    /// `finalize` cleanup), and no roborev verdict exists to satisfy a
+    /// `{roborev: ...}` requirement with. See this module's doc, and
+    /// `logic`'s `advance_issue`, for both.
+    #[tool(description = "Advance one issue to the next workflow phase \
+                       if it is clear to move: this writes the \
+                       status:<phase> label transition and nothing else. \
+                       A blocked issue is a normal successful answer \
+                       naming what blocks it (an unapproved gate, or the \
+                       specific unmet requirements), not an error. The \
+                       target phase's action is NEVER executed — no \
+                       agent is spawned, no merge is enqueued, no \
+                       cleanup runs.")]
+    pub async fn advance(
+        &self,
+        Parameters(args): Parameters<AdvanceArgs>,
+    ) -> Result<Json<AdvanceResult>, ErrorData> {
+        self.advance_inner(args).await.map(Json).map_err(tool_error)
+    }
+
     // -- tool bodies, split out so the `?` operator is usable and the
     //    error mapping happens in exactly one place per tool --
 
@@ -708,6 +781,33 @@ impl SpecFlowServer {
         .await?;
 
         Ok(SetGateResult::from_outcome(
+            &outcome,
+            &bound.name,
+            &bound.config.repo,
+        ))
+    }
+
+    async fn advance_inner(
+        &self,
+        args: AdvanceArgs,
+    ) -> Result<AdvanceResult, ToolError> {
+        let bound = self.bound_project()?;
+        let vcs = Arc::clone(&self.shared.vcs);
+
+        // The same read-the-binding-once discipline `approve_inner` and
+        // `set_gate_inner` use, and it matters here for the same reason:
+        // the label writes below go to `for_task`'s repo.
+        let for_task = bound.clone();
+        let outcome = blocking(move || {
+            logic::advance_issue(
+                vcs.as_ref(),
+                &for_task.config,
+                args.issue_number,
+            )
+        })
+        .await?;
+
+        Ok(AdvanceResult::from_outcome(
             &outcome,
             &bound.name,
             &bound.config.repo,

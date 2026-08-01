@@ -1,7 +1,7 @@
 //! The MCP tools' bodies, as ordinary synchronous functions over the
 //! [`Vcs`] seam — everything about §6's `register`/`board`/`issue`/
-//! `backlog`/`drift`/`approve`/`set_gate` that can be decided or
-//! fetched without an async runtime or an HTTP connection in scope.
+//! `backlog`/`drift`/`approve`/`set_gate`/`advance` that can be decided
+//! or fetched without an async runtime or an HTTP connection in scope.
 //!
 //! This is the split §5 asks for ("everything but the `git`/`gh` layer
 //! and the process spawner is unit-testable by stubbing those seams")
@@ -28,11 +28,12 @@ use crate::state::drift::{
     find_dependency_cycles, find_merged_pr_with_open_issue,
     find_multiple_open_linked_pull_requests, find_stale_claims,
 };
-use crate::state::{Claim, IssueSnapshot, read_issue_state};
+use crate::state::{Claim, IssueSnapshot, STATUS_PREFIX, read_issue_state};
 use crate::vcs::{IssueRelationships, IssueState, Vcs, VcsError};
 use crate::workflow::{
-    ApproveDecision, GateMode, LabelOp, Phase, PhaseAction, WorkflowConfig,
-    WorkflowError, effective_gate_mode, is_merge_gate, parse_workflow,
+    AdvanceDecision, ApproveDecision, GateMode, LabelOp, Phase, PhaseAction,
+    WorkflowConfig, WorkflowError, effective_gate_mode, is_merge_gate,
+    parse_workflow,
 };
 
 /// Errors an MCP tool call can fail with (§6).
@@ -744,6 +745,51 @@ pub struct SetGateOutcome {
     pub url: String,
 }
 
+/// What an `advance` call decided, and what (if anything) it wrote (§6).
+///
+/// The decision is [`crate::workflow::advance`]'s own, carried verbatim
+/// rather than collapsed into a boolean: §6 asks this tool to stop at a
+/// `human` gate, pass an `auto` one, and block on unmet `requires`, and
+/// those are three *different* answers a coordinator has to act on
+/// differently. Only [`AdvanceDecision::Advance`] writes anything; see
+/// this module's `advance_issue`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvanceOutcome {
+    /// Where the state machine says this issue can go next.
+    pub decision: AdvanceDecision,
+    /// The `status:<phase>` label this call added, when it advanced the
+    /// issue. `None` for every non-[`AdvanceDecision::Advance`] decision
+    /// (nothing was written at all), and also for an `Advance` into a
+    /// phase declaring no [`Phase::status_label`] — see
+    /// `advance_issue`'s "A target phase with no `status_label`"
+    /// section.
+    pub status_added: Option<String>,
+    /// The `status:<phase>` label this call removed — the issue's
+    /// previous status. `None` when nothing was written, or when the
+    /// target phase's `status_label` is the very label just added (see
+    /// `advance_issue`'s shared-`status_label` guard). An `Advance`
+    /// decision from an issue with no prior status label at all is not
+    /// reachable — [`crate::workflow::advance`] reports that case as
+    /// [`AdvanceDecision::NoCurrentPhase`] before any `Advance` can be
+    /// produced — so this field cannot be `None` for that reason in
+    /// practice; the code still matches on `snapshot.status` defensively
+    /// rather than asserting a state-machine invariant this type does
+    /// not itself enforce.
+    pub status_removed: Option<String>,
+    /// The issue as GitHub reports it *after* this call.
+    ///
+    /// On the advancing path this is a genuine re-read taken after the
+    /// label writes, the same discipline `approve_issue` and
+    /// `set_gate_for_issue` follow (§2.3). On every other path nothing
+    /// was written, so this is the single read the decision above was
+    /// computed from — which is the same statement about GitHub, made
+    /// without paying for a second round trip that could only differ if
+    /// another instance wrote in between.
+    pub snapshot: IssueSnapshot,
+    /// That issue's GitHub URL (§15).
+    pub url: String,
+}
+
 /// Find the phase `phase_id` names in the project's effective workflow.
 ///
 /// The lookup is by [`Phase::id`] — the id §4.3's `gate:<phase>` labels
@@ -1083,6 +1129,276 @@ pub fn set_gate_for_issue<V: Vcs>(
     })
 }
 
+/// Whether every issue `snapshot`'s `blockedBy` edges point at has
+/// merged or closed (§8.4) — the [`crate::RequirementContext`] fact
+/// [`Requirement::DepsMerged`](crate::Requirement::DepsMerged) reads,
+/// which no single issue's own state can answer.
+///
+/// The check is literally "is that issue [`IssueState::Closed`]", not
+/// "did it merge via a PR", because that is what the requirement itself
+/// is defined as: `Requirement::DepsMerged`'s doc says "every issue this
+/// one's `blockedBy` points at has merged **or closed**". A merged PR
+/// carrying `Closes #N` closes its issue, so the closed check subsumes
+/// the merged one; an issue closed as won't-fix genuinely does unblock
+/// its dependents, and treating it as still blocking would strand them.
+///
+/// # Fail-safe direction: an unreadable dependency is NOT satisfied
+///
+/// A `gh` failure on a dependency read (deleted, transferred,
+/// rate-limited, offline) returns `false` — the dependency is treated as
+/// unmerged. This is the **opposite** direction to [`read_drift`]'s
+/// choice, which reports an unreadable dependency as
+/// [`DriftFinding::DependencyOnMissingIssue`] and carries on, and the
+/// difference is deliberate: `drift` is a report, while this value feeds
+/// §8.1's merge gate ("don't enqueue a PR whose `blockedBy` is
+/// unmerged"). Failing open here would let an unverifiable dependency
+/// read as satisfied and clear the one gate §8.1 makes the server
+/// responsible for. Failing closed costs a blocked `advance` call the
+/// operator can retry; failing open costs an out-of-order merge nobody
+/// asked for. Each such read is logged at `warn` so the reason a call
+/// reported `deps_merged` unmet is visible in the daemon's own log, since
+/// the [`AdvanceDecision`] itself cannot distinguish "this dependency is
+/// open" from "this dependency could not be read".
+///
+/// Not built on [`dependency_states`], the similar-looking fan-out
+/// `read_drift` uses, for exactly that reason: that function's contract
+/// is "leave an unreadable issue *absent* from the map", which is the
+/// failure direction this one must not have. It also reads every open
+/// issue's dependencies at once, where this reads one issue's.
+///
+/// # Cost
+///
+/// One `gh issue view` per distinct `blockedBy` target, in issue-number
+/// order (a [`BTreeSet`], so a test can pin the sequence), short-
+/// circuiting at the first unsatisfied one. Zero for an issue with no
+/// dependencies.
+fn dependencies_satisfied<V: Vcs>(
+    vcs: &V,
+    repo: &str,
+    snapshot: &IssueSnapshot,
+) -> bool {
+    let dependencies: BTreeSet<u64> =
+        snapshot.relationships.blocked_by.iter().copied().collect();
+
+    for dependency in dependencies {
+        match vcs.read_issue(repo, dependency) {
+            Ok(issue) if issue.state == IssueState::Closed => {}
+            Ok(_) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    %repo,
+                    issue = snapshot.number,
+                    dependency,
+                    %error,
+                    "could not read a dependency issue; treating \
+                     deps_merged as unsatisfied so this fact cannot read \
+                     as satisfied on an unverifiable dependency (§8.1) \
+                     if the current or next phase happens to require it"
+                );
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// `advance(issue_number)` (§6) — the manual/coordinator override of the
+/// state machine: work out where this issue can go next and, when it can
+/// move, write that status-label transition through to GitHub (§15).
+///
+/// §6 defines the tool as stopping "at a `human` gate", passing "an
+/// `auto` gate", and blocking "on unmet `requires`". All three of those
+/// judgments are [`crate::workflow::advance`]'s, unchanged: this
+/// function reads the workflow and the issue, computes the two facts
+/// that pure function cannot derive from an [`IssueSnapshot`] alone (see
+/// [`crate::RequirementContext`]), calls it, and acts on exactly one of
+/// its outcomes.
+///
+/// # Every non-`Advance` decision is a successful answer, not an error
+///
+/// Asking "can this issue move" and being told "no, its merge gate is
+/// unapproved" is the tool working. So `NoCurrentPhase`, `UnknownPhase`,
+/// `BlockedOnGate`, `BlockedOnRequires`, `NextPhaseNotReady`,
+/// `NextPhaseGateBlocked` and `Done` all return `Ok` with the decision
+/// and **no write at all** — the same stance `board`/`backlog` take on
+/// an empty result. Mapping any of them to a [`ToolError`] would make a
+/// coordinator's ordinary "what's next here?" poll look like a failure.
+///
+/// # `roborev_verdict` is always `None` — a real, spec-confirmed gap
+///
+/// §12 says plainly that "**roborev** (which it can't derive) is
+/// `report`ed by an agent", and §6's `report` tool does not exist in
+/// this server (see [`super`]'s module doc). Nothing else in this crate
+/// carries a roborev verdict either: no label, comment convention, or
+/// `Vcs` method outside `crate::workflow`'s own `Requirement::Roborev`
+/// mentions one. So this passes `None`, and any phase whose `requires`
+/// includes `{roborev: ...}` reports that requirement in the `unmet`
+/// list of a [`AdvanceDecision::BlockedOnRequires`] or
+/// [`AdvanceDecision::NextPhaseNotReady`] — surfaced, not silently
+/// treated as satisfied ([`crate::requirement_satisfied`] compares the
+/// verdict for equality, so `None` never matches).
+///
+/// The shipped default's `review` phase declares exactly that
+/// requirement, so **on the shipped default this tool cannot currently
+/// move an issue into `review` at all**, no matter how green CI is. That
+/// is the honest state of the system until a `report` tool exists to
+/// supply the verdict, not a bug in this function to work around.
+///
+/// # The target phase's action is NOT executed
+///
+/// [`AdvanceDecision::Advance`] here writes the status-label transition
+/// and nothing else. No agent is spawned for an
+/// [`PhaseAction::Agent`]/[`PhaseAction::ServerThenAgent`] target; no
+/// merge is enqueued when the target is the merge gate (even though
+/// [`crate::plan_merge`] exists as a pure function ready to be called);
+/// no worktree, branch, label pruning or issue close happens when the
+/// target is `finalize`. This is the same boundary `approve`'s
+/// un-routed `deny` and the absent `next_assignment` already draw: no
+/// phase engine or spawner runs alongside this server.
+///
+/// It is drawn *uniformly* on purpose. Enqueueing a merge mechanically —
+/// the one target action this crate already has a pure decision function
+/// for — while leaving every other phase's action unexecuted would be a
+/// partial execution model in which some phases run and some do not,
+/// with nothing in the tool surface saying which. A merge-shaped
+/// exception is also the worst possible place to start, since §2.3b's
+/// one safety invariant is that nothing merges to the default branch by
+/// accident. One clean line ("this server moves labels; the phase engine
+/// runs phases") is both safer and easier to remove later than a
+/// carve-out. [`super::wire::AdvanceResult::action_executed`] states
+/// this in the result rather than leaving a client to infer it from a
+/// status label that moved.
+///
+/// # The label transition, and why it is written in that order
+///
+/// Add the target's `status:<label>` first, then remove the issue's
+/// previous one. If the second write fails, the issue is left carrying
+/// **two** `status:*` labels — which
+/// [`find_ambiguous_labels`] already reports as drift, so a half-applied
+/// transition surfaces in `drift()` (§15) instead of hiding. The reverse
+/// order fails worse: an issue left with *no* status label reads as
+/// `NoCurrentPhase` to every instance, i.e. as work that never started,
+/// and [`crate::workflow::advance`] cannot move it again without a human
+/// re-stamping a status by hand.
+///
+/// Both writes go through [`Vcs::set_label`], which needs the label to
+/// already exist in the repo; `spec-flow init` provisions every
+/// `status:<label>` a workflow declares
+/// ([`crate::workflow::label_vocabulary`], which reads both
+/// `labels.status` and every phase's `status_label`), so this succeeds
+/// for any project whose workflow has not gained a status since its last
+/// `init` — the already-recorded gap in that provisioning, not a new one.
+///
+/// # A target phase with no `status_label`
+///
+/// [`Phase::status_label`] is optional. Advancing into a phase that
+/// declares none writes **nothing at all** — not even the removal of the
+/// current status — and reports the `Advance` decision with both
+/// [`AdvanceOutcome::status_added`] and
+/// [`AdvanceOutcome::status_removed`] `None`. §2.3's state table makes
+/// the `status:*` label the *only* GitHub representation of workflow
+/// position, so removing the old label without writing a new one would
+/// erase the issue's position from the single source of truth and strand
+/// it at `NoCurrentPhase`. Leaving the old label in place is not
+/// correct either — it says the issue is still on the previous phase —
+/// but it is recoverable, and it is what the decision itself reports.
+/// The shipped default declares a `status_label` on every phase, so this
+/// case needs a team-edited workflow to reach.
+///
+/// # No comment is posted
+///
+/// Unlike [`approve_issue`], which records a human *decision* a label
+/// cannot always carry, an advance is fully expressed by the two labels
+/// it writes — the same reason [`set_gate_for_issue`] posts none. The
+/// deferral above (that the target phase's action did not run) is
+/// reported to the caller in the result; commenting it on the issue for
+/// every phase transition would put a running commentary on every issue
+/// the eventual phase engine advances, for a fact that is about this
+/// server's current shape rather than about the issue.
+///
+/// # Cost
+///
+/// [`read_issue_state`]'s usual three-to-four `gh` invocations for the
+/// read the decision is computed from (see [`read_board`]'s "Cost"
+/// section for what those are), plus one per distinct `blockedBy` target
+/// ([`dependencies_satisfied`]), plus one local file read for the
+/// workflow ([`load_workflow`]). An advancing call adds one or two `gh
+/// issue edit` calls and a second full issue re-read. A single-issue
+/// call with no open-issue fan-out — a reasoned count, not a measured
+/// one, unlike `board`/`backlog`/`drift`'s.
+pub fn advance_issue<V: Vcs>(
+    vcs: &V,
+    project: &ProjectConfig,
+    issue_number: u64,
+) -> Result<AdvanceOutcome, ToolError> {
+    // The workflow first, so a project whose `.spec-flow/workflow.yaml`
+    // is missing or malformed fails before any `gh` call — the same
+    // ordering `approve`/`set_gate` use, and the reason a broken config
+    // can never leave a half-written transition on an issue.
+    let workflow = load_workflow(project)?;
+    let (snapshot, url) = read_issue(vcs, project, issue_number)?;
+
+    let decision = crate::workflow::advance(
+        &workflow,
+        &snapshot,
+        dependencies_satisfied(vcs, &project.repo, &snapshot),
+        // Always `None` — see this function's roborev section.
+        None,
+    );
+
+    // Cloned out of the decision rather than matched by value, so the
+    // decision itself is still owned and reported below whichever way
+    // this goes.
+    let target_status = match &decision {
+        AdvanceDecision::Advance { to } => to.status_label.clone(),
+        _ => {
+            return Ok(AdvanceOutcome {
+                decision,
+                status_added: None,
+                status_removed: None,
+                snapshot,
+                url,
+            });
+        }
+    };
+    let Some(target_status) = target_status else {
+        return Ok(AdvanceOutcome {
+            decision,
+            status_added: None,
+            status_removed: None,
+            snapshot,
+            url,
+        });
+    };
+
+    let added = format!("{STATUS_PREFIX}{target_status}");
+    vcs.set_label(&project.repo, issue_number, &added, true)?;
+
+    // Guarded against removing the label just written: two phases in one
+    // workflow may share a `status_label` (nothing forbids it), in which
+    // case the "previous" status and the target's are the same string
+    // and the removal would undo the add, leaving the issue with no
+    // status at all.
+    let status_removed = match snapshot.status.as_deref() {
+        Some(current) if current != target_status => {
+            let removed = format!("{STATUS_PREFIX}{current}");
+            vcs.set_label(&project.repo, issue_number, &removed, false)?;
+            Some(removed)
+        }
+        _ => None,
+    };
+
+    let (snapshot, url) = read_issue(vcs, project, issue_number)?;
+    Ok(AdvanceOutcome {
+        decision,
+        status_added: Some(added),
+        status_removed,
+        snapshot,
+        url,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1094,6 +1410,7 @@ mod tests {
         Limits, MergeMode, save_project_config,
     };
     use crate::vcs::{FakeVcs, IssueState};
+    use crate::workflow::Requirement;
 
     fn global_config(projects: Vec<ProjectPointer>) -> GlobalConfig {
         GlobalConfig {
@@ -2376,5 +2693,540 @@ phases:
             Err(ToolError::UnknownPhase { .. })
         ));
         assert!(labels(&vcs).is_empty());
+    }
+
+    // -- advance --
+
+    /// Put issue 1 on `status:<status>` plus any extra labels, the way a
+    /// realistic in-flight issue carries them.
+    fn label_issue(vcs: &FakeVcs, status: Option<&str>, extra: &[&str]) {
+        if let Some(status) = status {
+            vcs.set_label(REPO, 1, &format!("status:{status}"), true).unwrap();
+        }
+        for label in extra {
+            vcs.set_label(REPO, 1, label, true).unwrap();
+        }
+    }
+
+    /// A green open PR linked to issue 1, so `{ci: green}` is satisfied.
+    fn seed_green_pull_request(vcs: &FakeVcs) {
+        seed_linked_pr(vcs, 1, &[(7, crate::vcs::PullRequestState::Open)]);
+    }
+
+    /// The three design-seam approvals §7.2 ph.5 requires before
+    /// `implement`.
+    const DESIGN_APPROVALS: &[&str] = &[
+        "approved:product-spec",
+        "approved:architecture",
+        "approved:test-plan",
+    ];
+
+    /// Run `advance_issue` and assert it changed nothing on the issue —
+    /// no label written either way, and no comment posted. Returns the
+    /// outcome so the caller can assert on the decision itself.
+    ///
+    /// The labels are compared as a sorted list rather than in place, so
+    /// this cannot pass merely because a write happened to be reordered.
+    fn advance_expecting_no_write(
+        vcs: &FakeVcs,
+        project: &ProjectConfig,
+    ) -> AdvanceOutcome {
+        let mut before = labels(vcs);
+        before.sort();
+        let comments_before = comments(vcs).len();
+
+        let outcome = advance_issue(vcs, project, 1).unwrap();
+
+        let mut after = labels(vcs);
+        after.sort();
+        assert_eq!(after, before, "a blocked advance must write no label");
+        assert_eq!(
+            comments(vcs).len(),
+            comments_before,
+            "advance posts no comment at all"
+        );
+        assert!(outcome.status_added.is_none());
+        assert!(outcome.status_removed.is_none());
+        outcome
+    }
+
+    #[test]
+    fn advance_writes_the_status_transition_and_returns_the_re_read_issue() {
+        // The shipped default's first hop: an approved `product-spec`
+        // advances to `conflict-check`.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("product-spec"), &["approved:product-spec"]);
+
+        let outcome = advance_issue(&vcs, &project, 1).unwrap();
+
+        assert!(matches!(
+            &outcome.decision,
+            AdvanceDecision::Advance { to } if to.id == "conflict-check"
+        ));
+        assert_eq!(
+            outcome.status_added.as_deref(),
+            Some("status:conflict-check")
+        );
+        assert_eq!(
+            outcome.status_removed.as_deref(),
+            Some("status:product-spec")
+        );
+        // The write really happened, and exactly one status label is
+        // left -- the old one is gone, not merely joined by a new one.
+        let labels = labels(&vcs);
+        assert!(labels.contains(&"status:conflict-check".to_string()));
+        assert!(!labels.contains(&"status:product-spec".to_string()));
+        assert!(labels.contains(&"approved:product-spec".to_string()));
+        // ...and the returned state is GitHub's answer, re-read after
+        // the write rather than assumed from it (§2.3).
+        assert_eq!(outcome.snapshot.status.as_deref(), Some("conflict-check"));
+        assert_eq!(outcome.url, "https://github.com/owner/repo-a/issues/1");
+        assert!(comments(&vcs).is_empty(), "advance posts no comment");
+    }
+
+    #[test]
+    fn advance_moves_a_ready_issue_into_implement() {
+        // §7.2 ph.5's handoff seam: `ready` is not a phase of its own,
+        // so this exercises the alias resolution through the real write
+        // path -- the `status:ready` label is what gets removed.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("ready"), DESIGN_APPROVALS);
+
+        let outcome = advance_issue(&vcs, &project, 1).unwrap();
+
+        assert!(matches!(
+            &outcome.decision,
+            AdvanceDecision::Advance { to } if to.id == "implement"
+        ));
+        assert_eq!(outcome.status_added.as_deref(), Some("status:implement"));
+        assert_eq!(outcome.status_removed.as_deref(), Some("status:ready"));
+        assert_eq!(outcome.snapshot.status.as_deref(), Some("implement"));
+    }
+
+    #[test]
+    fn advance_reports_no_current_phase_and_writes_nothing() {
+        // An issue still being groomed (§7.2 ph.1) carries no status
+        // label; stamping an initial one is `create_issue`'s job.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        let outcome = advance_expecting_no_write(&vcs, &project);
+
+        assert_eq!(outcome.decision, AdvanceDecision::NoCurrentPhase);
+        assert!(labels(&vcs).is_empty());
+    }
+
+    #[test]
+    fn advance_reports_an_unknown_status_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("triage"), &[]);
+
+        let outcome = advance_expecting_no_write(&vcs, &project);
+
+        assert_eq!(
+            outcome.decision,
+            AdvanceDecision::UnknownPhase { status: "triage".to_string() }
+        );
+    }
+
+    #[test]
+    fn advance_stops_at_an_unapproved_human_gate_and_writes_nothing() {
+        // §6's "stops at a `human` gate": `gate:architecture` is stamped
+        // at issue creation (§4.3) and no `approved:architecture` has
+        // been granted.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("architecture"), &["gate:architecture"]);
+
+        let outcome = advance_expecting_no_write(&vcs, &project);
+
+        assert_eq!(
+            outcome.decision,
+            AdvanceDecision::BlockedOnGate {
+                phase: "architecture".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn advance_blocks_on_the_current_phases_unmet_roborev_requirement() {
+        // The roborev gap, surfaced rather than swallowed: everything
+        // `review` requires is satisfied here EXCEPT `{roborev: clean}`
+        // -- CI is green and the issue has no dependencies -- and it is
+        // unmet only because this server has no `report` tool to have
+        // learned a verdict from (§12). If `advance_issue` ever passed a
+        // fabricated verdict, this list would come back empty and this
+        // issue would be cleared to enqueue a merge.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("review"), &["approved:merge"]);
+        seed_green_pull_request(&vcs);
+
+        let outcome = advance_expecting_no_write(&vcs, &project);
+
+        assert_eq!(
+            outcome.decision,
+            AdvanceDecision::BlockedOnRequires {
+                phase: "review".to_string(),
+                unmet: vec![Requirement::Roborev("clean".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn advance_cannot_enter_review_at_all_while_roborev_is_unreportable() {
+        // The same gap seen from the phase before it, and the more
+        // consequential half: an issue that has cleared `implement`
+        // completely, with the merge gate already approved and CI green,
+        // still cannot ENTER `review` -- whose action is the merge
+        // enqueue -- because its `{roborev: clean}` requirement is
+        // evaluated on entry and nothing can satisfy it today.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        let mut approvals = DESIGN_APPROVALS.to_vec();
+        approvals.push("approved:merge");
+        label_issue(&vcs, Some("implement"), &approvals);
+        seed_green_pull_request(&vcs);
+
+        let outcome = advance_expecting_no_write(&vcs, &project);
+
+        assert_eq!(
+            outcome.decision,
+            AdvanceDecision::NextPhaseNotReady {
+                phase: "review".to_string(),
+                unmet: vec![Requirement::Roborev("clean".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn advance_does_not_enter_review_without_the_merge_approval() {
+        // §4.3's "merge is special": `review`'s action runs on entry, so
+        // its gate is checked BEFORE the transition, not after -- and
+        // the gate check comes first, so this reports the gate rather
+        // than the roborev requirement.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        let mut labels_to_set = DESIGN_APPROVALS.to_vec();
+        labels_to_set.push("gate:review");
+        label_issue(&vcs, Some("implement"), &labels_to_set);
+        seed_green_pull_request(&vcs);
+
+        let outcome = advance_expecting_no_write(&vcs, &project);
+
+        assert_eq!(
+            outcome.decision,
+            AdvanceDecision::NextPhaseGateBlocked {
+                phase: "review".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn advance_reports_done_on_the_last_phase_and_writes_nothing() {
+        // `finalize`'s status_label is `done`, not its id -- an issue at
+        // `status:done` is on the last phase, with nothing after it.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("done"), &[]);
+
+        let outcome = advance_expecting_no_write(&vcs, &project);
+
+        assert_eq!(
+            outcome.decision,
+            AdvanceDecision::Done { phase: "finalize".to_string() }
+        );
+    }
+
+    #[test]
+    fn advance_treats_an_open_blocked_by_issue_as_unmerged() {
+        // §8.1's dependency ordering: #2 is open, so `deps_merged` is
+        // unmet and this issue must not reach the merge gate.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("review"), &["approved:merge"]);
+        seed_green_pull_request(&vcs);
+        seed_issue(&vcs, 2, &[], IssueState::Open);
+        seed_blocked_by(&vcs, 1, &[2]);
+
+        let outcome = advance_expecting_no_write(&vcs, &project);
+
+        assert_eq!(
+            outcome.decision,
+            AdvanceDecision::BlockedOnRequires {
+                phase: "review".to_string(),
+                unmet: vec![
+                    Requirement::Roborev("clean".to_string()),
+                    Requirement::DepsMerged,
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn advance_treats_a_closed_blocked_by_issue_as_merged() {
+        // The other side of the same check, and why it is written as
+        // "closed" rather than "merged via a PR": a dependency closed by
+        // its merged PR -- or closed as won't-fix -- genuinely unblocks
+        // this issue, so `deps_merged` drops out of the unmet list and
+        // only the unreportable roborev verdict is left.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("review"), &["approved:merge"]);
+        seed_green_pull_request(&vcs);
+        seed_issue(&vcs, 2, &[], IssueState::Closed);
+        seed_blocked_by(&vcs, 1, &[2]);
+
+        let outcome = advance_expecting_no_write(&vcs, &project);
+
+        assert_eq!(
+            outcome.decision,
+            AdvanceDecision::BlockedOnRequires {
+                phase: "review".to_string(),
+                unmet: vec![Requirement::Roborev("clean".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn advance_treats_a_dependency_it_cannot_read_as_unmerged() {
+        // The fail-safe direction, and the one place this deliberately
+        // differs from `read_drift` (which reports an unreadable
+        // dependency as *missing* drift and carries on): #9 is not
+        // seeded, so `gh` fails, and the dependency must count as
+        // UNMERGED. Failing the other way would clear §8.1's merge gate
+        // off a dependency nobody could verify.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("review"), &["approved:merge"]);
+        seed_green_pull_request(&vcs);
+        seed_blocked_by(&vcs, 1, &[9]);
+
+        let outcome = advance_expecting_no_write(&vcs, &project);
+
+        assert_eq!(
+            outcome.decision,
+            AdvanceDecision::BlockedOnRequires {
+                phase: "review".to_string(),
+                unmet: vec![
+                    Requirement::Roborev("clean".to_string()),
+                    Requirement::DepsMerged,
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn the_advance_wire_result_tags_a_unit_and_a_struct_requirement_alike() {
+        // The wire contract, not just the domain type -- checked here
+        // for the same reason `approve`'s denial test checks
+        // `reentry_triggered`: this is a multi-variant enum crossing the
+        // MCP boundary, and serde's internally-tagged representation is
+        // the one place a *unit* variant (`deps_merged`) could silently
+        // serialize into a different shape than its struct siblings
+        // (`roborev`). Exhaustiveness itself is guaranteed by the `From`
+        // impls' lack of a wildcard arm, not by this test.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("review"), &["approved:merge"]);
+        seed_green_pull_request(&vcs);
+        seed_issue(&vcs, 2, &[], IssueState::Open);
+        seed_blocked_by(&vcs, 1, &[2]);
+
+        let outcome = advance_issue(&vcs, &project, 1).unwrap();
+        let wire = super::super::wire::AdvanceResult::from_outcome(
+            &outcome, "proj-a", REPO,
+        );
+        let json = serde_json::to_value(&wire).unwrap();
+
+        assert_eq!(json["decision"]["kind"], "blocked_on_requires");
+        assert_eq!(json["decision"]["phase"], "review");
+        assert_eq!(json["decision"]["unmet"][0]["kind"], "roborev");
+        assert_eq!(json["decision"]["unmet"][0]["expected"], "clean");
+        assert_eq!(json["decision"]["unmet"][1]["kind"], "deps_merged");
+        assert_eq!(json["status_label_added"], serde_json::Value::Null);
+        assert_eq!(json["status_label_removed"], serde_json::Value::Null);
+        assert_eq!(json["action_executed"], false);
+        assert_eq!(json["issue"]["number"], 1);
+    }
+
+    #[test]
+    fn the_advance_wire_result_reports_a_transition_it_actually_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("product-spec"), &["approved:product-spec"]);
+
+        let outcome = advance_issue(&vcs, &project, 1).unwrap();
+        let wire = super::super::wire::AdvanceResult::from_outcome(
+            &outcome, "proj-a", REPO,
+        );
+        let json = serde_json::to_value(&wire).unwrap();
+
+        assert_eq!(json["decision"]["kind"], "advance");
+        // Only the phase's *id* crosses the wire, never the parsed
+        // `Phase` itself -- that would publish a team's workflow-file
+        // schema as an MCP contract.
+        assert_eq!(json["decision"]["to"], "conflict-check");
+        assert!(json["decision"].get("action").is_none());
+        assert_eq!(json["status_label_added"], "status:conflict-check");
+        assert_eq!(json["status_label_removed"], "status:product-spec");
+        // A status label moved, and still nothing ran: §7.1's phase
+        // engine does not run alongside this server.
+        assert_eq!(json["action_executed"], false);
+        assert_eq!(json["issue"]["status"], "conflict-check");
+    }
+
+    #[test]
+    fn advance_does_not_fail_the_whole_call_over_an_unreadable_dependency() {
+        // The other half of that choice, stated separately because it is
+        // a separate decision: an unreadable dependency blocks the
+        // advance, it does not turn the tool into an error. The operator
+        // still gets a decision naming what is unmet.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("review"), &["approved:merge"]);
+        seed_blocked_by(&vcs, 1, &[9]);
+
+        assert!(advance_issue(&vcs, &project, 1).is_ok());
+    }
+
+    #[test]
+    fn advance_reports_an_unknown_issue_as_a_vcs_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+
+        assert!(matches!(
+            advance_issue(&vcs, &project, 404),
+            Err(ToolError::Vcs(_))
+        ));
+    }
+
+    #[test]
+    fn advance_reports_a_project_with_no_workflow_file() {
+        // Same stance as `backlog`/`approve`: the phase sequence is
+        // *defined* by this file (§7.0), so a missing one fails loudly
+        // rather than falling back to the shipped default -- and it
+        // fails before any label is touched.
+        let tmp = tempfile::tempdir().unwrap();
+        let vcs = FakeVcs::new();
+        vcs.create_issue(REPO, "Widget cache", "").unwrap();
+        let project = project_config("a", REPO, tmp.path());
+        vcs.set_label(REPO, 1, "status:product-spec", true).unwrap();
+
+        assert!(matches!(
+            advance_issue(&vcs, &project, 1),
+            Err(ToolError::ReadWorkflow { .. })
+        ));
+        assert_eq!(labels(&vcs), vec!["status:product-spec".to_string()]);
+    }
+
+    /// Write a two-phase workflow whose second phase carries the
+    /// `status_label` `second_status` — omitted entirely when that is
+    /// `None`, which is the config shape `advance_issue`'s "target phase
+    /// with no `status_label`" case is about.
+    fn scaffold_two_phase_workflow(
+        project: &ProjectConfig,
+        second_status: Option<&str>,
+    ) {
+        let second = match second_status {
+            Some(status) => format!(", status_label: {status}"),
+            None => String::new(),
+        };
+        let statuses = match second_status {
+            Some(status) => format!("[first, {status}]"),
+            None => "[first]".to_string(),
+        };
+        let yaml = format!(
+            "\
+labels:
+  priority: [P0]
+  status: {statuses}
+  gate_prefix: \"gate:\"
+  approval_prefix: \"approved:\"
+  owner_prefix: \"owner:\"
+spec: {{tool: openspec, optional: true, skip_label: \"spec:skip\"}}
+review_panel: []
+fix_loop: {{max_rounds: 1, on_exhausted: escalate, on_decision_finding: escalate}}
+phases:
+  - {{id: first, action: {{type: agent, role: developer}}, gate: none, status_label: first}}
+  - {{id: second, action: {{type: agent, role: developer}}, gate: none{second}}}
+"
+        );
+        let path = workflow_path(project);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, yaml).unwrap();
+    }
+
+    #[test]
+    fn advance_into_a_phase_with_no_status_label_writes_nothing_at_all() {
+        // §2.3 makes the `status:*` label the ONLY GitHub record of
+        // workflow position, so a target phase declaring none has no
+        // label to write -- and removing the current one would erase the
+        // issue's position entirely, stranding it at `NoCurrentPhase`.
+        // The decision is still reported; the labels are left alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let vcs = FakeVcs::new();
+        vcs.create_issue(REPO, "Widget cache", "").unwrap();
+        let project = project_config("a", REPO, tmp.path());
+        scaffold_two_phase_workflow(&project, None);
+        vcs.set_label(REPO, 1, "status:first", true).unwrap();
+
+        let outcome = advance_expecting_no_write(&vcs, &project);
+
+        assert!(matches!(
+            &outcome.decision,
+            AdvanceDecision::Advance { to } if to.id == "second"
+        ));
+        assert_eq!(labels(&vcs), vec!["status:first".to_string()]);
+    }
+
+    #[test]
+    fn advance_does_not_remove_a_status_label_the_next_phase_also_claims() {
+        // Nothing forbids two phases sharing a `status_label`. Removing
+        // "the previous status" there would undo the add and leave the
+        // issue with no status at all -- the guard in `advance_issue`.
+        let tmp = tempfile::tempdir().unwrap();
+        let vcs = FakeVcs::new();
+        vcs.create_issue(REPO, "Widget cache", "").unwrap();
+        let project = project_config("a", REPO, tmp.path());
+        scaffold_two_phase_workflow(&project, Some("first"));
+        vcs.set_label(REPO, 1, "status:first", true).unwrap();
+
+        let outcome = advance_issue(&vcs, &project, 1).unwrap();
+
+        assert_eq!(outcome.status_added.as_deref(), Some("status:first"));
+        assert!(outcome.status_removed.is_none());
+        assert_eq!(labels(&vcs), vec!["status:first".to_string()]);
+        assert_eq!(outcome.snapshot.status.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn advance_only_acts_on_the_bound_projects_repo() {
+        // §15's "work is identified by (project, issue_number)": the
+        // same issue number in another repo must be untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let (vcs, project) = issue_and_project(tmp.path());
+        label_issue(&vcs, Some("product-spec"), &["approved:product-spec"]);
+        vcs.issues.borrow_mut().insert(
+            ("owner/repo-b".to_string(), 1),
+            crate::vcs::IssueRef {
+                number: 1,
+                title: "On b".to_string(),
+                body: String::new(),
+                labels: vec!["status:product-spec".to_string()],
+                state: IssueState::Open,
+            },
+        );
+
+        advance_issue(&vcs, &project, 1).unwrap();
+
+        assert_eq!(
+            vcs.issues.borrow()[&("owner/repo-b".to_string(), 1)].labels,
+            vec!["status:product-spec".to_string()],
+            "the other repo's issue must not have moved"
+        );
     }
 }

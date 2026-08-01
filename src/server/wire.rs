@@ -30,9 +30,13 @@ use crate::vcs::{
     CiConclusion, IssueRelationships, IssueState, PullRequestState,
     PullRequestStatus,
 };
-use crate::workflow::{ApproveDecision, GateMode};
+use crate::workflow::{
+    AdvanceDecision, ApproveDecision, GateMode, Requirement,
+};
 
-use super::logic::{ApproveOutcome, ClaimHolder, DriftReport, SetGateOutcome};
+use super::logic::{
+    AdvanceOutcome, ApproveOutcome, ClaimHolder, DriftReport, SetGateOutcome,
+};
 
 // ---------------------------------------------------------------------
 // register (§6 "Registration & lifecycle")
@@ -570,6 +574,209 @@ pub struct SetGateResult {
 }
 
 // ---------------------------------------------------------------------
+// advance (§6 "Work", §7.1)
+// ---------------------------------------------------------------------
+
+/// Arguments to `advance(issue_number)` (§6).
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+pub struct AdvanceArgs {
+    /// The issue number, within the connection's bound project's repo
+    /// (§15 — see [`IssueArgs::number`] for why there is no `project`
+    /// argument). Named `issue_number` because §6 names it that in this
+    /// tool's signature.
+    pub issue_number: u64,
+}
+
+/// What `advance` decided, what it wrote, and the issue afterwards (§6).
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+pub struct AdvanceResult {
+    /// Where the state machine says this issue can go next — including
+    /// every "it cannot move, and here is precisely why" answer, which
+    /// is a normal successful result rather than an error (see
+    /// `logic`'s `advance_issue`).
+    pub decision: AdvanceDecisionWire,
+
+    /// The `status:<phase>` label this call added to the issue, or
+    /// `null` when nothing was written.
+    ///
+    /// `null` alongside a `decision.kind` of `advance` is a real, if
+    /// unusual, case: the target phase declares no `status_label`, so
+    /// there was no label to write and the previous one was deliberately
+    /// left in place rather than erasing the issue's only GitHub-durable
+    /// record of its workflow position (§2.3). See `logic`'s
+    /// `advance_issue`.
+    pub status_label_added: Option<String>,
+
+    /// The `status:<phase>` label this call removed — the issue's
+    /// previous position. `null` when nothing was written, when the
+    /// issue carried no status label at all, or when the target phase's
+    /// own status label is the one just added.
+    pub status_label_removed: Option<String>,
+
+    /// Whether the daemon executed the target phase's action.
+    ///
+    /// **Always `false`.** An `advance` writes the status-label
+    /// transition and nothing else: no agent is spawned for an
+    /// agent-action target, no merge is enqueued when the target is the
+    /// merge gate, and no `finalize` cleanup runs — no phase engine or
+    /// spawner runs alongside this server (see `src/server/mod.rs`'s
+    /// module doc). Reported as a field rather than left to be inferred
+    /// from a status label that moved, for the same §15 "surface, don't
+    /// bury" reason [`ApproveResult::reentry_triggered`] exists.
+    pub action_executed: bool,
+
+    /// The issue as GitHub reports it now — the same shape
+    /// `issue(number)` returns. A genuine re-read after the write on the
+    /// advancing path; on every other path nothing was written, so it is
+    /// the read the decision was computed from.
+    pub issue: IssueResult,
+}
+
+/// One `advance` decision (§6, §7.1) — the wire form of
+/// [`AdvanceDecision`].
+///
+/// Internally tagged on `kind`, exactly as [`DriftFindingWire`] is and
+/// for the same reason: a client switches on one stable field rather
+/// than on the single key of a `{"BlockedOnGate": {...}}` object.
+///
+/// Every "blocked" variant is a **successful** answer to §6's question,
+/// not an error — see `logic`'s `advance_issue`.
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AdvanceDecisionWire {
+    /// The issue carries no `status:<phase>` label, so there is nothing
+    /// to advance from. Stamping an initial status is issue creation's
+    /// job (§6 `create_issue`), which this server does not implement.
+    NoCurrentPhase,
+
+    /// The issue's `status:<phase>` label matches no phase in this
+    /// project's `.spec-flow/workflow.yaml` — drift, not a decision the
+    /// state machine can make.
+    UnknownPhase {
+        /// The unrecognized status (the label's suffix, e.g. `triage`).
+        status: String,
+    },
+
+    /// The current phase is parked on a gate that is not clear (§4.3):
+    /// §6's "stops at a `human` gate". Clear it with `approve` (or the
+    /// `approved:<phase>` label) and call again.
+    BlockedOnGate {
+        /// The current phase's id.
+        phase: String,
+    },
+
+    /// The current phase's own `requires` are not all satisfied (§7.1):
+    /// §6's "blocks on unmet `requires`".
+    BlockedOnRequires {
+        /// The current phase's id.
+        phase: String,
+        /// Every requirement still unmet, in the order the workflow
+        /// declares them.
+        unmet: Vec<RequirementWire>,
+    },
+
+    /// The current phase is clear, but the **next** phase's own
+    /// `requires` are not — checked before entering it, because a
+    /// phase's action can run on entry (the shipped default's `review`
+    /// phase *is* the merge enqueue). Distinct from
+    /// `blocked_on_requires`, which is about the phase the issue is on
+    /// now.
+    NextPhaseNotReady {
+        /// The id of the phase the issue is not yet clear to enter.
+        phase: String,
+        /// Every one of that phase's requirements still unmet.
+        unmet: Vec<RequirementWire>,
+    },
+
+    /// The next phase is a mechanical server phase whose own gate is not
+    /// clear — checked before entering it, since its action runs on
+    /// entry and *is* what the gate exists to hold back (§4.3's "merge
+    /// is special", and any per-issue `gate:<phase>` override).
+    NextPhaseGateBlocked {
+        /// The id of the server phase the issue is not yet clear to
+        /// enter.
+        phase: String,
+    },
+
+    /// The issue advanced. `status_label_added`/`status_label_removed`
+    /// report the transition actually written, and `action_executed`
+    /// reports that the target phase's action did **not** run.
+    Advance {
+        /// The id of the phase the issue advanced to.
+        to: String,
+    },
+
+    /// The issue is on the last phase of the pipeline; there is nothing
+    /// further to advance to. (§7.2's out-of-band re-entries are not
+    /// part of this linear sequence.)
+    Done {
+        /// The final phase's id.
+        phase: String,
+    },
+}
+
+/// One unmet phase entry condition (§7.1 `requires`) — the wire form of
+/// [`Requirement`].
+///
+/// Internally tagged on `kind` like its siblings above. The variants
+/// carry their payload under a *named* field rather than as a bare
+/// string, because the four kinds' payloads are not the same thing: an
+/// approval names a phase, `ci`/`roborev` name an expected value, and
+/// `unrecognized` carries text this crate could not classify at all.
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequirementWire {
+    /// `approved:<phase>` — that phase's approval label must be on the
+    /// issue (§4.3).
+    Approved {
+        /// The bare phase key the approval names (e.g. `architecture`),
+        /// matching the form [`IssueResult::approvals`] carries.
+        phase: String,
+    },
+
+    /// `deps_merged` — every issue this one's `blockedBy` points at must
+    /// have merged or closed (§8.4).
+    ///
+    /// Reported as unmet **also** when a dependency issue could not be
+    /// read at all: that failure is treated as "not merged" so an
+    /// unverifiable dependency can never clear §8.1's merge gate, and
+    /// this shape cannot distinguish the two (the daemon logs which it
+    /// was). See `logic`'s `dependencies_satisfied`.
+    DepsMerged,
+
+    /// `{ci: <value>}` — the linked pull request's CI conclusion must
+    /// equal `expected`. Unmet when there is no linked PR at all.
+    Ci {
+        /// The value the workflow asks for (`green` in the shipped
+        /// default).
+        expected: String,
+    },
+
+    /// `{roborev: <value>}` — the most recently reported roborev verdict
+    /// must equal `expected`.
+    ///
+    /// **Currently always unmet.** §12 makes roborev a signal an agent
+    /// `report`s, and this server implements no `report` tool, so it
+    /// holds no verdict to compare against — see `src/server/mod.rs`'s
+    /// module doc. On the shipped default this is what keeps an issue
+    /// out of `review`.
+    Roborev {
+        /// The value the workflow asks for (`clean` in the shipped
+        /// default).
+        expected: String,
+    },
+
+    /// A requirement this crate does not interpret (§7.1 names
+    /// `status:<phase>` and `lease:<resource>` shapes the shipped
+    /// default never uses). Always reported as unmet: a condition the
+    /// daemon cannot evaluate must never read as satisfied.
+    Unrecognized {
+        /// The requirement verbatim, as the workflow file spells it.
+        requirement: String,
+    },
+}
+
+// ---------------------------------------------------------------------
 // Shared leaf shapes
 // ---------------------------------------------------------------------
 
@@ -879,6 +1086,116 @@ impl ApproveResult {
             approval_label: outcome.approval_label.clone(),
             reentry: outcome.reentry.clone(),
             reentry_triggered: false,
+            issue: IssueResult::from_snapshot(
+                &outcome.snapshot,
+                project,
+                repo,
+                outcome.url.clone(),
+            ),
+        }
+    }
+}
+
+impl From<&Requirement> for RequirementWire {
+    // Exhaustive despite `Requirement` being `#[non_exhaustive]`, for
+    // the same reason `DriftFinding`'s mapping above is: that attribute
+    // constrains other crates, not this one, so a new requirement kind
+    // fails to compile here until it is given a wire shape instead of
+    // silently collapsing into a catch-all arm and vanishing from every
+    // `unmet` list a client reads.
+    fn from(requirement: &Requirement) -> RequirementWire {
+        match requirement {
+            Requirement::Approved(phase) => {
+                RequirementWire::Approved { phase: phase.clone() }
+            }
+            Requirement::DepsMerged => RequirementWire::DepsMerged,
+            Requirement::Ci(expected) => {
+                RequirementWire::Ci { expected: expected.clone() }
+            }
+            Requirement::Roborev(expected) => {
+                RequirementWire::Roborev { expected: expected.clone() }
+            }
+            Requirement::Unrecognized(requirement) => {
+                RequirementWire::Unrecognized {
+                    requirement: requirement.clone(),
+                }
+            }
+        }
+    }
+}
+
+impl From<&AdvanceDecision> for AdvanceDecisionWire {
+    // Exhaustive on purpose — see [`RequirementWire`]'s mapping above.
+    // `AdvanceDecision` is `#[non_exhaustive]` precisely because it
+    // expects to grow (its own doc names §7.4's external-review case),
+    // and a new decision silently reaching a client as some other
+    // decision's shape is the failure this match's lack of a wildcard
+    // prevents.
+    fn from(decision: &AdvanceDecision) -> AdvanceDecisionWire {
+        match decision {
+            AdvanceDecision::NoCurrentPhase => {
+                AdvanceDecisionWire::NoCurrentPhase
+            }
+            AdvanceDecision::UnknownPhase { status } => {
+                AdvanceDecisionWire::UnknownPhase { status: status.clone() }
+            }
+            AdvanceDecision::BlockedOnGate { phase } => {
+                AdvanceDecisionWire::BlockedOnGate { phase: phase.clone() }
+            }
+            AdvanceDecision::BlockedOnRequires { phase, unmet } => {
+                AdvanceDecisionWire::BlockedOnRequires {
+                    phase: phase.clone(),
+                    unmet: unmet.iter().map(Into::into).collect(),
+                }
+            }
+            AdvanceDecision::NextPhaseNotReady { phase, unmet } => {
+                AdvanceDecisionWire::NextPhaseNotReady {
+                    phase: phase.clone(),
+                    unmet: unmet.iter().map(Into::into).collect(),
+                }
+            }
+            AdvanceDecision::NextPhaseGateBlocked { phase } => {
+                AdvanceDecisionWire::NextPhaseGateBlocked {
+                    phase: phase.clone(),
+                }
+            }
+            // Only the phase's *id* crosses the wire, not the whole
+            // `Phase` the decision carries: that type is the parsed
+            // shape of a team's own `workflow.yaml` (actions, artifact
+            // specs, requirement enums), and publishing it here would
+            // freeze the config schema as an MCP contract — the exact
+            // thing this module's doc exists to prevent. A client that
+            // wants the phase's definition reads the file.
+            AdvanceDecision::Advance { to } => {
+                AdvanceDecisionWire::Advance { to: to.id.clone() }
+            }
+            AdvanceDecision::Done { phase } => {
+                AdvanceDecisionWire::Done { phase: phase.clone() }
+            }
+        }
+    }
+}
+
+impl AdvanceResult {
+    /// Project an [`AdvanceOutcome`] onto the wire, tagging its issue
+    /// with the connection's bound project (§2.5).
+    ///
+    /// `action_executed` is written as a literal `false` here rather
+    /// than read off the outcome, exactly as
+    /// [`ApproveResult::reentry_triggered`] is: nothing in this crate
+    /// can set it true, and a domain field that could only ever be
+    /// copied from a hard-coded `false` would just move the same claim
+    /// one layer down. See its own doc.
+    pub fn from_outcome(
+        outcome: &AdvanceOutcome,
+        project: &str,
+        repo: &str,
+    ) -> AdvanceResult {
+        AdvanceResult {
+            decision: (&outcome.decision).into(),
+            status_label_added: outcome.status_added.clone(),
+            status_label_removed: outcome.status_removed.clone(),
+            action_executed: false,
             issue: IssueResult::from_snapshot(
                 &outcome.snapshot,
                 project,
