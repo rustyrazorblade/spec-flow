@@ -321,6 +321,11 @@ pub trait Vcs {
     /// Add (`present = true`) or remove (`present = false`) a label on
     /// an issue. A single boolean-setter method per the style guide's
     /// `yes: bool` convention, rather than two near-identical methods.
+    ///
+    /// [`ShellVcs`]'s implementation currently cannot add a label name
+    /// that doesn't already exist in the repo — see
+    /// `ShellVcs::set_label`'s doc for the confirmed, unresolved
+    /// conflict this creates with `crate::claim::write_claim`.
     fn set_label(
         &self,
         repo: &str,

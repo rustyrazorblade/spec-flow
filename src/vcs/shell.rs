@@ -503,6 +503,50 @@ impl Vcs for ShellVcs {
         })
     }
 
+    /// # `label` must survive `gh`'s CSV-based flag parsing
+    ///
+    /// `--add-label`/`--remove-label` are `pflag` `StringSliceVar`
+    /// flags, parsed as a single CSV record (confirmed by reading `gh`'s
+    /// and `spf13/pflag`'s source, not just its `--help` text): a comma
+    /// splits the value into multiple labels, a newline **silently
+    /// truncates** it at the first line break (no error — the tail is
+    /// just gone), and a `"` fails the parse outright. This method does
+    /// not re-validate `label`; every caller composing a label from
+    /// dynamic/user-influenced text (`crate::claim::write_claim`'s
+    /// `owner:<instance_id>@<epoch>`) is responsible for keeping its own
+    /// input within a safe character set first — see
+    /// `crate::claim::is_valid_instance_id`.
+    ///
+    /// # CONFIRMED: `gh issue edit --add-label` requires the label to
+    /// already exist in the repository — it does not auto-create
+    ///
+    /// Read from `gh`'s own source (`api.RepoMetadataResult.LabelsToIDs`
+    /// in `cli/cli`, which `gh issue edit`'s add-label path calls to
+    /// resolve label names to GraphQL IDs before mutating): an unknown
+    /// label name returns `'<name>' not found`, full stop — there is no
+    /// auto-create branch. This is a real, unresolved conflict with how
+    /// `crate::claim::write_claim` is specified to work (§8.2): its
+    /// `owner:<instance>@<epoch>` label encodes a fresh epoch in the
+    /// label's own **name** on every heartbeat rewrite, so every single
+    /// heartbeat this method is asked to add is, by construction, a
+    /// label name that has never existed in the repo before — this call
+    /// will fail against a real GitHub repository on every attempt.
+    /// Making the claim protocol actually work needs a design decision
+    /// this method must not make unilaterally (pre-create every label
+    /// via a separate `gh label create` call before each add, which
+    /// would permanently accumulate one label per heartbeat per
+    /// instance per issue in the repo's label list; move the mutable
+    /// heartbeat data out of the label name entirely, e.g. into an
+    /// issue comment or a stable `owner:<instance>` label's own
+    /// last-updated timestamp; or something else) — flagged here for
+    /// whoever wires `write_claim` into a live `serve` daemon (§14 step
+    /// 6+), not silently worked around in this step. Whatever resolution
+    /// is chosen must also respect GitHub's ~50-character label-name
+    /// cap: any encoding that keeps `<instance>@<epoch>` in the name
+    /// itself leaves only ~33 characters for `instance_id` after the
+    /// `owner:` prefix and a 10-digit epoch, well under the width of
+    /// e.g. a UUID `instance_id` — a candidate `serve` auto-generation
+    /// format (§11.1) hasn't picked one yet.
     fn set_label(
         &self,
         repo: &str,

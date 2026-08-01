@@ -253,6 +253,11 @@ impl Vcs for FakeVcs {
         })
     }
 
+    /// Unlike `ShellVcs::set_label`, this fake always accepts a novel
+    /// label name — it models the trait's stated contract, not the real
+    /// `gh issue edit --add-label`'s "label must already exist"
+    /// limitation. See `ShellVcs::set_label`'s doc for that confirmed
+    /// conflict; do not rely on this fake to catch it.
     fn set_label(
         &self,
         repo: &str,
@@ -260,13 +265,33 @@ impl Vcs for FakeVcs {
         label: &str,
         present: bool,
     ) -> Result<(), VcsError> {
-        let mut labels = self.labels.borrow_mut();
-        let entry =
-            labels.entry((repo.to_string(), issue_number)).or_default();
-        if present {
-            entry.insert(label.to_string());
-        } else {
-            entry.remove(label);
+        let key = (repo.to_string(), issue_number);
+        {
+            let mut labels = self.labels.borrow_mut();
+            let entry = labels.entry(key.clone()).or_default();
+            if present {
+                entry.insert(label.to_string());
+            } else {
+                entry.remove(label);
+            }
+        }
+        // Keep a seeded `issues` entry's own `labels` field (what
+        // `read_issue` returns) in sync with this call, so a caller that
+        // writes a label here and then re-reads the issue — the
+        // work-claim write-then-settle-read protocol (§8.2) being the
+        // motivating case — sees its own write reflected, mirroring real
+        // GitHub, where `gh issue edit --add-label` is visible to the
+        // very next `gh issue view`. Before this, `issues` and `labels`
+        // were two independent stores and a `set_label` call was
+        // invisible to `read_issue` entirely.
+        if let Some(issue) = self.issues.borrow_mut().get_mut(&key) {
+            if present {
+                if !issue.labels.iter().any(|l| l == label) {
+                    issue.labels.push(label.to_string());
+                }
+            } else {
+                issue.labels.retain(|l| l != label);
+            }
         }
         Ok(())
     }
@@ -538,6 +563,42 @@ mod tests {
         let read = vcs.read_pull_request_status("owner/repo", 7).unwrap();
 
         assert_eq!(read, status);
+    }
+
+    #[test]
+    fn set_label_is_visible_to_a_subsequent_read_issue() {
+        // The property the work-claim write-then-settle-read protocol
+        // (§8.2) depends on: a label written via `set_label` must be
+        // visible to the very next `read_issue`, exactly as it would be
+        // against real GitHub.
+        let vcs = FakeVcs::new();
+        vcs.issues.borrow_mut().insert(
+            ("owner/repo".to_string(), 42),
+            IssueRef {
+                number: 42,
+                title: "Widget cache".to_string(),
+                body: String::new(),
+                labels: vec!["status:implement".to_string()],
+                state: IssueState::Open,
+            },
+        );
+
+        vcs.set_label("owner/repo", 42, "owner:instance-a@100", true).unwrap();
+
+        let issue = vcs.read_issue("owner/repo", 42).unwrap();
+        assert_eq!(
+            issue.labels,
+            vec![
+                "status:implement".to_string(),
+                "owner:instance-a@100".to_string(),
+            ]
+        );
+
+        vcs.set_label("owner/repo", 42, "owner:instance-a@100", false)
+            .unwrap();
+
+        let issue = vcs.read_issue("owner/repo", 42).unwrap();
+        assert_eq!(issue.labels, vec!["status:implement".to_string()]);
     }
 
     #[test]

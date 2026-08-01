@@ -201,7 +201,7 @@ impl ProcessSpawner {
     ///
     /// Mints a fresh [`SpawnToken`], substitutes it and `prompt`/
     /// `worktree` into the harness's command template (see
-    /// [`template::interpolate_command`]), and launches the result as a
+    /// `template::interpolate_command`), and launches the result as a
     /// subprocess whose working directory is `worktree` — so the
     /// process is already sitting in the right project/branch context
     /// (§2.6). Returns immediately without waiting for the process to

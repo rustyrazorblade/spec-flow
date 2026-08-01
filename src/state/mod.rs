@@ -114,9 +114,23 @@ impl Claim {
     /// non-numeric epoch — every one of these is "not an owner claim",
     /// not a distinct error, since a caller is scanning arbitrary issue
     /// labels and most of them are never owner claims at all.
-    fn parse(label: &str) -> Option<Claim> {
+    ///
+    /// Splits on the **last** `@`, not the first: `instance_id` is
+    /// operator-supplied (§11.1) and nothing stops it from containing
+    /// its own `@` (an email- or host-shaped id, e.g. `jon@mbp`). Since
+    /// only the trailing segment is ever numeric, `rsplit_once` parses
+    /// `owner:jon@mbp@1700000000` back to instance `jon@mbp` — the exact
+    /// value that was written — instead of failing to parse the epoch
+    /// and silently producing "not a claim at all" for a real, freshly
+    /// written claim, which would confirm_claim into a permanent
+    /// LostToOther and livelock the instance against its own writes
+    /// (§8.2 promises "never a livelock").
+    ///
+    /// `pub(crate)` — see [`STATUS_PREFIX`]; [`crate::claim`] reuses this
+    /// same parse rather than duplicating it.
+    pub(crate) fn parse(label: &str) -> Option<Claim> {
         let rest = label.strip_prefix(OWNER_PREFIX)?;
-        let (instance, epoch) = rest.split_once('@')?;
+        let (instance, epoch) = rest.rsplit_once('@')?;
         if instance.is_empty() {
             return None;
         }
@@ -341,6 +355,20 @@ mod tests {
     #[test]
     fn claim_rejects_an_empty_instance_id() {
         assert!(Claim::parse("owner:@1700000000").is_none());
+    }
+
+    #[test]
+    fn claim_parses_an_instance_id_containing_its_own_at_sign() {
+        // instance_id is operator-supplied (§11.1) and can be email- or
+        // host-shaped (`jon@mbp`). Splitting on the FIRST `@` would grab
+        // "jon" as the instance and fail to parse "mbp@1700000000" as a
+        // number, silently rejecting a real, freshly written claim —
+        // exactly the round-trip failure that would livelock an
+        // instance against its own writes (§8.2).
+        let claim = Claim::parse("owner:jon@mbp@1700000000").unwrap();
+
+        assert_eq!(claim.instance, "jon@mbp");
+        assert_eq!(claim.epoch, 1_700_000_000);
     }
 
     // -- Priority::parse --

@@ -201,7 +201,13 @@ pub struct GlobalConfig {
     /// Auto-generated and persisted on first `spec-flow serve` when
     /// unset; that generation is `spec-flow serve`'s job (a later task),
     /// not this module's — [`load_global_config`] leaves it as `None`
-    /// verbatim.
+    /// verbatim. When that auto-generation is written, it must treat a
+    /// present-but-empty `Some(String::new())` (a plausible outcome of a
+    /// hand-edited `instance_id: ""` in the YAML — one keystroke away
+    /// from the unset `instance_id:` that means `None`) as unset too:
+    /// `crate::claim::write_claim` rejects an empty `instance_id`
+    /// outright (`ClaimError::EmptyInstanceId`) rather than writing a
+    /// claim label it could never parse back as its own.
     #[serde(default)]
     pub instance_id: Option<String>,
 
