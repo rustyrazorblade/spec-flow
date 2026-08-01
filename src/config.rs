@@ -80,6 +80,24 @@ pub enum ConfigError {
          unset); pass an explicit config path instead"
     )]
     HomeDirUnavailable,
+
+    /// A project's `weight: 0` was read back from `path` (§12, §14 step
+    /// 10). Rejected at load time rather than silently promoted to the
+    /// default weight of `1` by the scheduler: an operator who wrote
+    /// `weight: 0` almost certainly meant "de-prioritize this project
+    /// heavily," and silently treating it as normal-priority equal
+    /// weight would be exactly the wrong reading of that intent, with no
+    /// feedback that anything was ignored. Omitting the field entirely
+    /// (not writing `weight: 0`) is how a project actually gets the
+    /// default weight.
+    #[error(
+        "{path}: weight: 0 is not a valid project weight (omit the field \
+         entirely for the default weight of 1)"
+    )]
+    InvalidWeight {
+        /// The project config file `weight: 0` was read from.
+        path: PathBuf,
+    },
 }
 
 /// One entry in the global config's project registry (§2.5, §4.2).
@@ -168,6 +186,31 @@ pub struct Limits {
     pub max_concurrent_agents: u32,
 }
 
+/// How the scheduler picks **which project** to serve when a spawn slot
+/// frees, before applying the within-project order (§12, §14 step 10).
+///
+/// `crate::schedule`'s `Candidate`/`next_action`/`schedule_order` (§14
+/// step 5) already answer "which issue, within one project" — this
+/// governs the dimension on top of that: with several projects each
+/// having actionable work, which one gets this slot.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossProjectMode {
+    /// Fair-share round-robin, weighted by each project's
+    /// [`ProjectConfig::weight`] (default equal) — no repo starves.
+    /// §12's shipped default.
+    #[default]
+    FairShare,
+    /// All projects' actionable issues ranked as one global set (the
+    /// same furthest-along/priority/age ordering `schedule_order` uses
+    /// within a project, applied across all of them at once) — for
+    /// operators who'd rather one global ordering than per-project
+    /// fairness.
+    GlobalPriorityPool,
+}
+
 /// Work-claim heartbeat/reclaim tuning (§8.2).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClaimConfig {
@@ -220,6 +263,11 @@ pub struct GlobalConfig {
 
     /// Global spawn limits (§12).
     pub limits: Limits,
+
+    /// Cross-project fairness policy (§12, §14 step 10) — how the
+    /// scheduler picks which project gets a freed spawn slot.
+    #[serde(default)]
+    pub cross_project_mode: CrossProjectMode,
 
     /// Work-claim heartbeat/reclaim tuning (§8.2).
     pub claim: ClaimConfig,
@@ -307,6 +355,22 @@ pub struct ProjectConfig {
 
     /// The shared memory store id for this repo (§10.3).
     pub memory_scope: String,
+
+    /// This project's weight for fair-share cross-project scheduling
+    /// (§12, §14 step 10) — `None` means the default weight of `1`,
+    /// same as every other project that leaves this unset. Only
+    /// consulted under [`CrossProjectMode::FairShare`]; ignored entirely
+    /// under [`CrossProjectMode::GlobalPriorityPool`], which ranks every
+    /// project's issues as one set instead.
+    ///
+    /// `Some(0)` is rejected at [`load_project_config`] time
+    /// ([`ConfigError::InvalidWeight`]) rather than silently treated as
+    /// `None`/`1` — an operator writing `weight: 0` almost certainly
+    /// means "de-prioritize this heavily," and equal-weight-by-default
+    /// is the opposite of that intent. Omit the field entirely for the
+    /// default weight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
 }
 
 /// The path to the machine-global daemon config,
@@ -378,15 +442,23 @@ pub fn save_global_config(
 /// # Errors
 ///
 /// [`ConfigError::Read`] if the file can't be read, [`ConfigError::Parse`]
-/// if its contents aren't a valid [`ProjectConfig`].
+/// if its contents aren't a valid [`ProjectConfig`], [`ConfigError::
+/// InvalidWeight`] if `weight: 0` was set explicitly (see that variant's
+/// doc for why this is rejected rather than silently promoted to the
+/// default weight).
 pub fn load_project_config(path: &Path) -> Result<ProjectConfig, ConfigError> {
     let text = fs::read_to_string(path).map_err(|source| {
         ConfigError::Read { path: path.to_path_buf(), source }
     })?;
-    serde_yaml::from_str(&text).map_err(|source| ConfigError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })
+    let config: ProjectConfig =
+        serde_yaml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if config.weight == Some(0) {
+        return Err(ConfigError::InvalidWeight { path: path.to_path_buf() });
+    }
+    Ok(config)
 }
 
 /// Write a single project's config to `path`, creating parent
@@ -439,6 +511,7 @@ mod tests {
                 )]),
             },
             limits: Limits { max_concurrent_agents: 3 },
+            cross_project_mode: CrossProjectMode::FairShare,
             claim: ClaimConfig {
                 heartbeat_ttl: Duration::from_secs(3600),
                 heartbeat_interval: Duration::from_secs(300),
@@ -466,6 +539,7 @@ mod tests {
             harness: Some("codex".to_string()),
             index_path: PathBuf::from("/abs/path/to/repo-a/index"),
             memory_scope: "owner-repo-a".to_string(),
+            weight: Some(2),
         }
     }
 
@@ -482,6 +556,30 @@ mod tests {
     }
 
     #[test]
+    fn global_config_defaults_cross_project_mode_when_absent_from_the_file() {
+        // A pre-step-10 config.yaml on disk has no `cross_project_mode:`
+        // key at all -- the upgrade path must not fail to parse it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "listen: \"127.0.0.1:7420\"\n\
+             instance_id: null\n\
+             binaries: {git: git, gh: gh}\n\
+             harnesses: {default: claude, claude: {command: [claude]}}\n\
+             limits: {max_concurrent_agents: 3}\n\
+             claim: {heartbeat_ttl: 1h, heartbeat_interval: 5m}\n\
+             phase_timeout: 45m\n\
+             projects: []\n",
+        )
+        .unwrap();
+
+        let loaded = load_global_config(&path).unwrap();
+
+        assert_eq!(loaded.cross_project_mode, CrossProjectMode::FairShare);
+    }
+
+    #[test]
     fn project_config_round_trips_through_yaml() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
@@ -491,6 +589,35 @@ mod tests {
         let loaded = load_project_config(&path).unwrap();
 
         assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn load_project_config_rejects_an_explicit_weight_of_zero() {
+        // weight: 0 almost certainly means "de-prioritize this heavily"
+        // -- silently promoting it to the default weight of 1 (equal
+        // priority) would be exactly backwards from that intent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let mut config = sample_project_config();
+        config.weight = Some(0);
+        save_project_config(&path, &config).unwrap();
+
+        let error = load_project_config(&path).unwrap_err();
+
+        assert!(matches!(error, ConfigError::InvalidWeight { .. }));
+    }
+
+    #[test]
+    fn load_project_config_accepts_a_positive_weight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let mut config = sample_project_config();
+        config.weight = Some(3);
+        save_project_config(&path, &config).unwrap();
+
+        let loaded = load_project_config(&path).unwrap();
+
+        assert_eq!(loaded.weight, Some(3));
     }
 
     #[test]

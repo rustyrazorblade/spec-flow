@@ -88,7 +88,9 @@ pub fn find_project_containing<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Binaries, ClaimConfig, HarnessesConfig, Limits};
+    use crate::config::{
+        Binaries, ClaimConfig, CrossProjectMode, HarnessesConfig, Limits,
+    };
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -103,6 +105,7 @@ mod tests {
                 harnesses: HashMap::new(),
             },
             limits: Limits { max_concurrent_agents: 3 },
+            cross_project_mode: CrossProjectMode::FairShare,
             claim: ClaimConfig {
                 heartbeat_ttl: Duration::from_secs(3600),
                 heartbeat_interval: Duration::from_secs(300),

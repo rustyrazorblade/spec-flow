@@ -1,5 +1,10 @@
 //! The scheduler's default ordering (§12, §14 step 5): given a batch of
-//! issues' scheduling-relevant facts, decide which one to work on next.
+//! issues' scheduling-relevant facts, decide which one to work on next
+//! *within one project* ([`Candidate`], [`next_action`],
+//! [`schedule_order`]); and, layered on top (§14 step 10), which
+//! *project* gets a freed spawn slot at all when several have work
+//! ([`ProjectQueue`], [`next_action_across_projects`],
+//! [`FairShareState`]).
 //!
 //! This module is a **pure function over already-computed facts** — no
 //! [`crate::vcs::Vcs`], no I/O, no clock. §12's ordering needs three
@@ -71,6 +76,7 @@
 //! (§14 step 6+), not to this module. Nothing here implements or
 //! simulates a sleep/backoff loop.
 
+use crate::config::CrossProjectMode;
 use crate::state::Priority;
 
 /// The shipped default phase order (§7.2), shallowest (least advanced)
@@ -231,6 +237,214 @@ pub fn schedule_order(candidates: &[Candidate]) -> Vec<u64> {
 /// nothing in `candidates` is actionable right now.
 pub fn next_action(candidates: &[Candidate]) -> Option<u64> {
     schedule_order(candidates).into_iter().next()
+}
+
+/// One project's candidate list for cross-project scheduling (§12, §14
+/// step 10), paired with its identity and fair-share weight.
+///
+/// `weight` is the already-defaulted value (`crate::config::
+/// ProjectConfig::weight.unwrap_or(1)`, or simply `1` for a project that
+/// hasn't set one) — this module has no config type to read the default
+/// from itself, matching every other module's "pure function over
+/// already-resolved facts" shape (see this module's own doc for why
+/// [`Candidate`] takes `dependencies_satisfied`/`claimed_live` the same
+/// way).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectQueue {
+    /// The project's name (`crate::config::ProjectConfig::name`).
+    pub project: String,
+    /// This project's candidates, in the same shape [`schedule_order`]
+    /// takes for one project alone.
+    pub candidates: Vec<Candidate>,
+    /// This project's fair-share weight (§12) — higher gets
+    /// proportionally more turns under [`CrossProjectMode::FairShare`].
+    /// Ignored entirely under [`CrossProjectMode::GlobalPriorityPool`].
+    pub weight: u32,
+}
+
+/// Which project's issue [`next_action_across_projects`] recommends
+/// next — an issue number alone is not enough once more than one
+/// project is in play, since issue numbers are only unique *within* a
+/// repo (§15).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduledIssue {
+    /// The project the recommended issue belongs to.
+    pub project: String,
+    /// The recommended issue's number, scoped to that project.
+    pub issue: u64,
+}
+
+/// Cross-project fair-share round-robin state (§12), carried by the
+/// caller between scheduling ticks.
+///
+/// A real accumulator, not re-derivable from a single snapshot the way
+/// everything else in this module is — smooth weighted round-robin (the
+/// same family of algorithm nginx/LVS use for weighted backend
+/// selection) needs to remember each project's running "credit" across
+/// calls to interleave proportionally to weight rather than in bursts
+/// (weights 3:1 gives `A A B A` repeating, not `A A A B`). Kept as
+/// explicit state a caller threads through — never a `static`/interior-
+/// mutability singleton — for the same testability reason
+/// `crate::claim`'s functions take `now` as a parameter instead of
+/// reading the wall clock: a test can start from any state and inspect
+/// exactly what the next call produces.
+///
+/// Never prunes an entry for a project that stops appearing in
+/// `projects` (deregistered, or simply idle this run) — a project's
+/// credit is always bounded (never more than one full "weight sum"
+/// ahead or behind, by the same invariant that makes the algorithm fair
+/// at all), so a stale entry costs a caller at most a one-tick phase
+/// shift if that project ever reappears, never unbounded growth or a
+/// correctness problem. A caller managing a long-lived daemon process
+/// across many project registry changes may still want to garbage-collect
+/// entries for permanently-removed projects for memory hygiene, but
+/// nothing in this crate does that today since no long-running caller
+/// exists yet.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FairShareState {
+    current_weights: std::collections::BTreeMap<String, i64>,
+}
+
+/// The cross-project scheduling decision (§12, §14 step 10): given
+/// several projects each with their own actionable candidates, decide
+/// **which project** gets the next freed spawn slot, then apply
+/// [`next_action`] *within* it.
+///
+/// Two policies, per `mode`:
+///
+/// - [`CrossProjectMode::FairShare`] (the shipped default): smooth
+///   weighted round-robin over `state`, considering only projects with
+///   at least one actionable candidate (an idle project neither accrues
+///   credit nor competes for this tick — it isn't being starved by
+///   sitting out a round it has nothing to contribute to).
+/// - [`CrossProjectMode::GlobalPriorityPool`]: every project's
+///   actionable candidates ranked together by the exact same
+///   furthest-along → priority → age ordering [`schedule_order`] uses
+///   within one project. **This carries a real, unavoidable bias**: the
+///   "age" component of that ordering is the issue number itself (see
+///   `scheduling_key`'s doc), which is only a meaningful age proxy
+///   *within* one repo — across repos it just reflects which repo has
+///   accumulated more issues over its lifetime. Two candidates tied on
+///   phase and priority are compared by issue number **first**, and
+///   only an *exact* issue-number collision falls through to the
+///   project-name tie-break; a younger, low-issue-count repo's work
+///   therefore wins every such comparison against an older,
+///   high-issue-count repo's work, indefinitely. `GlobalPriorityPool`
+///   has no way to correct this without a real per-issue timestamp
+///   [`Candidate`] does not carry (see this module's "age" doc); an
+///   operator who cares about this should prefer [`CrossProjectMode::
+///   FairShare`], which is immune to it since it compares projects by
+///   weight, never by raw issue number across repos.
+///
+/// Returns `None` when no project has any actionable candidate at all.
+pub fn next_action_across_projects(
+    projects: &[ProjectQueue],
+    mode: CrossProjectMode,
+    state: &mut FairShareState,
+) -> Option<ScheduledIssue> {
+    match mode {
+        CrossProjectMode::GlobalPriorityPool => {
+            let mut tagged: Vec<(&str, &Candidate)> = projects
+                .iter()
+                .flat_map(|project| {
+                    project
+                        .candidates
+                        .iter()
+                        .filter(|candidate| is_actionable(candidate))
+                        .map(move |candidate| {
+                            (project.project.as_str(), candidate)
+                        })
+                })
+                .collect();
+            tagged.sort_by_key(|(project, candidate)| {
+                (scheduling_key(candidate), (*project).to_string())
+            });
+            tagged.into_iter().next().map(|(project, candidate)| {
+                ScheduledIssue {
+                    project: project.to_string(),
+                    issue: candidate.issue,
+                }
+            })
+        }
+        CrossProjectMode::FairShare => select_fair_share(projects, state),
+    }
+}
+
+/// [`CrossProjectMode::FairShare`]'s smooth weighted round-robin — see
+/// [`next_action_across_projects`]'s doc for the policy this implements
+/// and [`FairShareState`]'s doc for why it needs carried-in state at
+/// all.
+///
+/// Every project with actionable work has its credit (`current_weights`)
+/// increased by its own weight; the project with the highest resulting
+/// credit is selected (ties broken toward the alphabetically first
+/// project name, for a deterministic result rather than an
+/// insertion-order accident); the selected project's credit is then
+/// reduced by the sum of every considered project's weight. This is the
+/// textbook algorithm nginx documents for weighted backend selection —
+/// not invented here — chosen because a naive "repeat each project
+/// `weight` times in a flat list" round-robin produces bursty runs
+/// (`A A A B` for a 3:1 split) rather than an evenly-spread interleaving
+/// (`A A B A`), and §12 only says "no repo starves," which bursty
+/// round-robin technically satisfies but evenly-spread service is a
+/// strictly better reading of "fair."
+///
+/// `weight` is floored at `1` here (`weight.max(1)`) as a **second,
+/// structural** line of defense, not the primary one: `weight: 0` from a
+/// project's own config file is already rejected outright at
+/// `crate::config::load_project_config` time (`ConfigError::
+/// InvalidWeight`) rather than silently promoted to `1`, since an
+/// operator writing `0` almost certainly means "de-prioritize this
+/// heavily," not "give it the default." This floor exists for
+/// [`ProjectQueue`] itself: it is a public type any future caller could
+/// construct with `weight: 0` directly (a test, a future in-memory
+/// caller bypassing file-based config entirely) — an unclamped `0`
+/// would never accrue credit and would starve that project forever,
+/// which no config-layer validation reaches once the value has already
+/// arrived as a plain `u32` here. §12's "no repo starves" is treated as
+/// a hard invariant of the scheduler itself, not just of the config
+/// loader that is the normal path into it.
+fn select_fair_share(
+    projects: &[ProjectQueue],
+    state: &mut FairShareState,
+) -> Option<ScheduledIssue> {
+    let actionable: Vec<&ProjectQueue> = projects
+        .iter()
+        .filter(|project| project.candidates.iter().any(is_actionable))
+        .collect();
+    if actionable.is_empty() {
+        return None;
+    }
+
+    let total_weight: i64 = actionable
+        .iter()
+        .map(|project| i64::from(project.weight.max(1)))
+        .sum();
+    for project in &actionable {
+        let weight = i64::from(project.weight.max(1));
+        *state.current_weights.entry(project.project.clone()).or_insert(0) +=
+            weight;
+    }
+
+    let selected = actionable
+        .iter()
+        .max_by(|a, b| {
+            let credit_a = state.current_weights[&a.project];
+            let credit_b = state.current_weights[&b.project];
+            // On a credit tie, prefer the alphabetically first project
+            // name -- comparing b against a (rather than a against b)
+            // makes a smaller name compare as "greater," so `max_by`
+            // picks it deterministically instead of an insertion-order
+            // accident.
+            credit_a.cmp(&credit_b).then_with(|| b.project.cmp(&a.project))
+        })
+        .expect("actionable is non-empty, checked above");
+
+    let selected_name = selected.project.clone();
+    *state.current_weights.get_mut(&selected_name).unwrap() -= total_weight;
+
+    next_action(&selected.candidates)
+        .map(|issue| ScheduledIssue { project: selected_name, issue })
 }
 
 #[cfg(test)]
@@ -461,5 +675,364 @@ mod tests {
             .collect();
 
         assert_eq!(scaffolded_statuses, DEFAULT_PHASE_ORDER);
+    }
+
+    // -- next_action_across_projects: GlobalPriorityPool --
+
+    fn project(
+        name: &str,
+        weight: u32,
+        candidates: Vec<Candidate>,
+    ) -> ProjectQueue {
+        ProjectQueue { project: name.to_string(), candidates, weight }
+    }
+
+    #[test]
+    fn global_priority_pool_picks_the_furthest_along_issue_across_projects() {
+        let projects = [
+            project("alpha", 1, vec![candidate(1, "product-spec")]),
+            project("beta", 1, vec![candidate(1, "review")]),
+        ];
+        let mut state = FairShareState::default();
+
+        let picked = next_action_across_projects(
+            &projects,
+            CrossProjectMode::GlobalPriorityPool,
+            &mut state,
+        );
+
+        assert_eq!(
+            picked,
+            Some(ScheduledIssue { project: "beta".to_string(), issue: 1 })
+        );
+    }
+
+    #[test]
+    fn global_priority_pool_breaks_a_full_tie_by_project_name() {
+        // Same phase, same priority, same issue number -- issue numbers
+        // are only unique per repo (§15), so project name is the only
+        // thing left to break the tie deterministically.
+        let projects = [
+            project("zulu", 1, vec![candidate(1, "implement")]),
+            project("alpha", 1, vec![candidate(1, "implement")]),
+        ];
+        let mut state = FairShareState::default();
+
+        let picked = next_action_across_projects(
+            &projects,
+            CrossProjectMode::GlobalPriorityPool,
+            &mut state,
+        );
+
+        assert_eq!(
+            picked,
+            Some(ScheduledIssue { project: "alpha".to_string(), issue: 1 })
+        );
+    }
+
+    #[test]
+    fn global_priority_pool_ignores_weight_entirely() {
+        let projects = [
+            project("low-weight", 100, vec![candidate(1, "product-spec")]),
+            project("high-weight", 1, vec![candidate(1, "review")]),
+        ];
+        let mut state = FairShareState::default();
+
+        let picked = next_action_across_projects(
+            &projects,
+            CrossProjectMode::GlobalPriorityPool,
+            &mut state,
+        );
+
+        // "review" is furthest-along regardless of which project has the
+        // bigger weight -- weight is a FairShare-only concept.
+        assert_eq!(
+            picked,
+            Some(ScheduledIssue {
+                project: "high-weight".to_string(),
+                issue: 1
+            })
+        );
+    }
+
+    #[test]
+    fn global_priority_pool_is_none_when_nothing_is_actionable() {
+        let mut gated = candidate(1, "architecture");
+        gated.gates = vec!["architecture".to_string()];
+        let projects = [project("alpha", 1, vec![gated])];
+        let mut state = FairShareState::default();
+
+        let picked = next_action_across_projects(
+            &projects,
+            CrossProjectMode::GlobalPriorityPool,
+            &mut state,
+        );
+
+        assert_eq!(picked, None);
+    }
+
+    // -- next_action_across_projects: FairShare --
+
+    #[test]
+    fn fair_share_alternates_perfectly_between_two_equal_weight_projects() {
+        let projects = [
+            project("alpha", 1, vec![candidate(1, "implement")]),
+            project("beta", 1, vec![candidate(1, "implement")]),
+        ];
+        let mut state = FairShareState::default();
+
+        let picks: Vec<String> = (0..4)
+            .map(|_| {
+                next_action_across_projects(
+                    &projects,
+                    CrossProjectMode::FairShare,
+                    &mut state,
+                )
+                .unwrap()
+                .project
+            })
+            .collect();
+
+        assert_eq!(
+            picks,
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "alpha".to_string(),
+                "beta".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fair_share_interleaves_a_weighted_project_smoothly_not_in_a_burst() {
+        // The textbook smooth-weighted-round-robin example: a 3:1 split
+        // gives `A A B A` repeating, never a burst of `A A A B` -- see
+        // `select_fair_share`'s doc for why that distinction matters.
+        let projects = [
+            project("heavy", 3, vec![candidate(1, "implement")]),
+            project("light", 1, vec![candidate(1, "implement")]),
+        ];
+        let mut state = FairShareState::default();
+
+        let picks: Vec<String> = (0..4)
+            .map(|_| {
+                next_action_across_projects(
+                    &projects,
+                    CrossProjectMode::FairShare,
+                    &mut state,
+                )
+                .unwrap()
+                .project
+            })
+            .collect();
+
+        assert_eq!(
+            picks,
+            vec![
+                "heavy".to_string(),
+                "heavy".to_string(),
+                "light".to_string(),
+                "heavy".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fair_share_3_to_1_split_repeats_the_same_cycle_indefinitely() {
+        // 8 ticks (two full cycles), not 4: proves the state actually
+        // returns to zero after one cycle and repeats identically,
+        // rather than merely happening to look right for the first
+        // cycle before drifting.
+        let projects = [
+            project("heavy", 3, vec![candidate(1, "implement")]),
+            project("light", 1, vec![candidate(1, "implement")]),
+        ];
+        let mut state = FairShareState::default();
+
+        let picks: Vec<String> = (0..8)
+            .map(|_| {
+                next_action_across_projects(
+                    &projects,
+                    CrossProjectMode::FairShare,
+                    &mut state,
+                )
+                .unwrap()
+                .project
+            })
+            .collect();
+
+        let one_cycle =
+            ["heavy", "heavy", "light", "heavy"].map(str::to_string);
+        assert_eq!(picks, [one_cycle.clone(), one_cycle].concat());
+    }
+
+    #[test]
+    fn fair_share_reproduces_the_canonical_nginx_five_one_one_sequence() {
+        // The exact example nginx's own SWRR documentation uses for
+        // three backends weighted 5:1:1 -- the strongest single pin on
+        // this algorithm: it exercises three projects at once, a
+        // mid-cycle tie between the two weight-1 projects, and the full
+        // long-run 5:1:1 proportion in one assertion.
+        let projects = [
+            project("a", 5, vec![candidate(1, "implement")]),
+            project("b", 1, vec![candidate(1, "implement")]),
+            project("c", 1, vec![candidate(1, "implement")]),
+        ];
+        let mut state = FairShareState::default();
+
+        let picks: Vec<String> = (0..7)
+            .map(|_| {
+                next_action_across_projects(
+                    &projects,
+                    CrossProjectMode::FairShare,
+                    &mut state,
+                )
+                .unwrap()
+                .project
+            })
+            .collect();
+
+        assert_eq!(
+            picks,
+            ["a", "a", "b", "a", "c", "a", "a"].map(str::to_string)
+        );
+        // The cycle must have closed exactly -- every project's credit
+        // back to zero, so an eighth tick starts the same sequence over.
+        assert_eq!(state.current_weights[&"a".to_string()], 0);
+        assert_eq!(state.current_weights[&"b".to_string()], 0);
+        assert_eq!(state.current_weights[&"c".to_string()], 0);
+    }
+
+    #[test]
+    fn fair_share_does_not_let_an_intermittently_idle_project_bank_credit() {
+        // Project "sometimes" only has work on odd ticks; "always" has
+        // work throughout. "sometimes" going idle must not let it
+        // accumulate unbounded credit while absent and then monopolize
+        // slots once it returns.
+        let always = project("always", 1, vec![candidate(1, "implement")]);
+        let sometimes_present =
+            project("sometimes", 1, vec![candidate(1, "implement")]);
+        let sometimes_absent = project("sometimes", 1, Vec::new());
+        let mut state = FairShareState::default();
+
+        let mut picks = Vec::new();
+        for tick in 0..6 {
+            let projects = if tick % 2 == 0 {
+                [always.clone(), sometimes_present.clone()]
+            } else {
+                [always.clone(), sometimes_absent.clone()]
+            };
+            picks.push(
+                next_action_across_projects(
+                    &projects,
+                    CrossProjectMode::FairShare,
+                    &mut state,
+                )
+                .unwrap()
+                .project,
+            );
+        }
+
+        // "always" is the only actionable project on every odd tick, so
+        // it must win those regardless of "sometimes"'s credit; it must
+        // never run away with every remaining even tick too.
+        assert_eq!(picks[1], "always");
+        assert_eq!(picks[3], "always");
+        assert_eq!(picks[5], "always");
+        assert!(picks.iter().any(|p| p == "sometimes"));
+    }
+
+    #[test]
+    fn fair_share_gives_every_slot_to_the_only_actionable_project() {
+        let mut gated = candidate(1, "architecture");
+        gated.gates = vec!["architecture".to_string()];
+        let projects = [
+            project("blocked", 1, vec![gated]),
+            project("free", 1, vec![candidate(1, "implement")]),
+        ];
+        let mut state = FairShareState::default();
+
+        for _ in 0..3 {
+            let picked = next_action_across_projects(
+                &projects,
+                CrossProjectMode::FairShare,
+                &mut state,
+            );
+            assert_eq!(
+                picked,
+                Some(ScheduledIssue { project: "free".to_string(), issue: 1 })
+            );
+        }
+    }
+
+    #[test]
+    fn fair_share_applies_the_within_project_order_once_a_project_is_chosen() {
+        // Cross-project fairness picks the PROJECT; the existing §12
+        // tiers 1-4 still decide which issue within it.
+        let projects = [project(
+            "alpha",
+            1,
+            vec![candidate(1, "product-spec"), candidate(2, "review")],
+        )];
+        let mut state = FairShareState::default();
+
+        let picked = next_action_across_projects(
+            &projects,
+            CrossProjectMode::FairShare,
+            &mut state,
+        );
+
+        assert_eq!(
+            picked,
+            Some(ScheduledIssue { project: "alpha".to_string(), issue: 2 })
+        );
+    }
+
+    #[test]
+    fn fair_share_is_none_when_no_project_has_actionable_work() {
+        let mut gated = candidate(1, "architecture");
+        gated.gates = vec!["architecture".to_string()];
+        let projects = [project("alpha", 1, vec![gated])];
+        let mut state = FairShareState::default();
+
+        let picked = next_action_across_projects(
+            &projects,
+            CrossProjectMode::FairShare,
+            &mut state,
+        );
+
+        assert_eq!(picked, None);
+    }
+
+    #[test]
+    fn fair_share_floors_a_directly_constructed_zero_weight_at_one() {
+        // weight: 0 from a project's own config file is rejected outright
+        // at `crate::config::load_project_config` time
+        // (`ConfigError::InvalidWeight`) -- it can only reach here via a
+        // `ProjectQueue` built directly, bypassing config loading (a
+        // test, or a future in-memory caller). The scheduler still
+        // floors it at 1 here so §12's "no repo starves" holds as an
+        // invariant of the scheduler itself, not only of the config
+        // loader that is the normal path into it.
+        let projects = [
+            project("alpha", 0, vec![candidate(1, "implement")]),
+            project("beta", 1, vec![candidate(1, "implement")]),
+        ];
+        let mut state = FairShareState::default();
+
+        let picks: Vec<String> = (0..2)
+            .map(|_| {
+                next_action_across_projects(
+                    &projects,
+                    CrossProjectMode::FairShare,
+                    &mut state,
+                )
+                .unwrap()
+                .project
+            })
+            .collect();
+
+        assert_eq!(picks, vec!["alpha".to_string(), "beta".to_string()]);
     }
 }

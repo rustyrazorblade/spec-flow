@@ -25,10 +25,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    Binaries, ClaimConfig, ConfigError, GhConfig, GlobalConfig, HarnessConfig,
-    HarnessesConfig, Limits, MergeMode, ProjectConfig, ProjectPointer,
-    load_global_config, load_project_config, project_config_path,
-    save_global_config, save_project_config,
+    Binaries, ClaimConfig, ConfigError, CrossProjectMode, GhConfig,
+    GlobalConfig, HarnessConfig, HarnessesConfig, Limits, MergeMode,
+    ProjectConfig, ProjectPointer, load_global_config, load_project_config,
+    project_config_path, save_global_config, save_project_config,
 };
 use crate::registry::add_project;
 use crate::scaffold::{ScaffoldError, scaffold_spec_flow_dir};
@@ -364,13 +364,15 @@ fn resolve_project_config<V: Vcs>(
         .to_string_lossy()
         .into_owned();
 
-    // `gh`/`harness` are operator-added-by-hand fields (§4.2, §11.1) —
-    // `gh`'s ambient host/account is right unless configured for several
-    // (§8.5), and the harness falls back to the global
-    // `harnesses.default` (§2.6). Detection can't (re-)produce either,
-    // so a re-`init` must carry forward whatever the operator already
-    // set on this project rather than wiping it back to `None`.
-    let (gh, harness) = existing_overrides(&project_dir)?;
+    // `gh`/`harness`/`weight` are operator-added-by-hand fields (§4.2,
+    // §11.1) — `gh`'s ambient host/account is right unless configured
+    // for several (§8.5), the harness falls back to the global
+    // `harnesses.default` (§2.6), and `weight` falls back to the default
+    // weight of `1` (§12, §14 step 10). Detection can't (re-)produce any
+    // of the three, so a re-`init` must carry forward whatever the
+    // operator already set on this project rather than wiping it back
+    // to `None`.
+    let overrides = existing_overrides(&project_dir)?;
 
     Ok(ProjectConfig {
         name,
@@ -381,17 +383,28 @@ fn resolve_project_config<V: Vcs>(
         repo,
         default_branch,
         merge_mode,
-        gh,
-        harness,
+        gh: overrides.gh,
+        harness: overrides.harness,
+        weight: overrides.weight,
     })
 }
 
-/// The `gh`/`harness` overrides already recorded in
-/// `<project_dir>/config.yaml`, if a config is there to read.
+/// The operator-added-by-hand overrides [`existing_overrides`] reads
+/// back from `<project_dir>/config.yaml`, if a config is there to read.
 ///
-/// Absent only on a fresh `init` (no file yet) — anything else that
-/// keeps the file from being read is a hard error, not "nothing to
-/// carry forward"; see the `# Errors` section below.
+/// All fields absent only on a fresh `init` (no file yet) — anything
+/// else that keeps the file from being read is a hard error, not
+/// "nothing to carry forward"; see [`existing_overrides`]'s `# Errors`
+/// section.
+#[derive(Default)]
+struct ExistingOverrides {
+    gh: Option<GhConfig>,
+    harness: Option<String>,
+    weight: Option<u32>,
+}
+
+/// Read [`ExistingOverrides`] back from `project_dir`'s config file, if
+/// one exists yet.
 ///
 /// # Errors
 ///
@@ -400,20 +413,24 @@ fn resolve_project_config<V: Vcs>(
 /// exists and fails to parse (a hand-edit gone wrong) or fails to read
 /// (a permissions problem) is NOT "nothing to carry forward": `init_at`
 /// is about to overwrite this file, and warning-then-proceeding would
-/// still destroy the operator's `gh`/`harness` overrides the moment it
-/// printed the warning — exactly the clobber this function exists to
-/// prevent. A hard failure here tells the operator to fix or remove the
-/// file before re-running `init`, rather than `init` silently
-/// regenerating over it.
+/// still destroy the operator's overrides the moment it printed the
+/// warning — exactly the clobber this function exists to prevent. A
+/// hard failure here tells the operator to fix or remove the file
+/// before re-running `init`, rather than `init` silently regenerating
+/// over it.
 fn existing_overrides(
     project_dir: &Path,
-) -> Result<(Option<GhConfig>, Option<String>), ConfigError> {
+) -> Result<ExistingOverrides, ConfigError> {
     match load_project_config(&project_config_path(project_dir)) {
-        Ok(existing) => Ok((existing.gh, existing.harness)),
+        Ok(existing) => Ok(ExistingOverrides {
+            gh: existing.gh,
+            harness: existing.harness,
+            weight: existing.weight,
+        }),
         Err(ConfigError::Read { ref source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
-            Ok((None, None))
+            Ok(ExistingOverrides::default())
         }
         Err(error) => Err(error),
     }
@@ -490,6 +507,7 @@ fn default_global_config() -> GlobalConfig {
             .collect(),
         },
         limits: Limits { max_concurrent_agents: 3 },
+        cross_project_mode: CrossProjectMode::default(),
         claim: ClaimConfig {
             heartbeat_ttl: std::time::Duration::from_secs(60 * 60),
             heartbeat_interval: std::time::Duration::from_secs(5 * 60),
@@ -612,6 +630,7 @@ mod tests {
                 harness: None,
                 index_path: fixture.project_dir.join("index"),
                 memory_scope: "owner-repo-a".to_string(),
+                weight: None,
             }
         );
     }
@@ -989,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn re_running_init_preserves_hand_added_gh_and_harness_overrides() {
+    fn re_running_init_preserves_hand_added_gh_harness_and_weight_overrides() {
         let fixture = Fixture::new();
         fixture.init().unwrap();
         let mut edited = fixture.project_config();
@@ -998,6 +1017,7 @@ mod tests {
             account: "me".to_string(),
         });
         edited.harness = Some("codex".to_string());
+        edited.weight = Some(5);
         save_project_config(
             &project_config_path(&fixture.project_dir),
             &edited,
@@ -1009,6 +1029,7 @@ mod tests {
         let reloaded = fixture.project_config();
         assert_eq!(reloaded.gh, edited.gh);
         assert_eq!(reloaded.harness, edited.harness);
+        assert_eq!(reloaded.weight, edited.weight);
     }
 
     #[test]
@@ -1038,5 +1059,30 @@ mod tests {
                 .unwrap(),
             "gh: [this is not a project config\n"
         );
+    }
+
+    #[test]
+    fn re_running_init_over_an_existing_zero_weight_fails_loudly() {
+        // weight: 0 is rejected at `load_project_config` time
+        // (§14 step 10) -- a re-init must surface that as a hard
+        // failure via the same `existing_overrides` catch-all that
+        // handles an unparseable file, not silently ignore it.
+        let fixture = Fixture::new();
+        fixture.init().unwrap();
+        let mut edited = fixture.project_config();
+        edited.weight = Some(0);
+        let path = project_config_path(&fixture.project_dir);
+        save_project_config(&path, &edited).unwrap();
+
+        assert!(matches!(
+            fixture.init(),
+            Err(InitError::Config(ConfigError::InvalidWeight { .. }))
+        ));
+
+        // Untouched: a rejected re-init must not overwrite the file it
+        // couldn't safely read from. Read the raw text, not via
+        // `load_project_config` -- that call would itself error on the
+        // same `weight: 0` this test just wrote.
+        assert!(fs::read_to_string(&path).unwrap().contains("weight: 0"));
     }
 }

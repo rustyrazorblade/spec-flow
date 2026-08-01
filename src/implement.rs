@@ -187,6 +187,7 @@ mod tests {
             harness: None,
             index_path: PathBuf::from("/projects/repo-a/index"),
             memory_scope: "owner-repo-a".to_string(),
+            weight: None,
         }
     }
 
