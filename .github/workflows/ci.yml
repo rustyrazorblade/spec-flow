@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build, test, clippy, fmt, doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub-hosted ubuntu runners ship `git` and `gh` preinstalled;
+      # the shell-vcs tests only exercise plain `git` against a
+      # throwaway local remote and never call `gh` for real.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --all-targets
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo fmt
+        run: cargo fmt -- --check
+
+      - name: cargo doc
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

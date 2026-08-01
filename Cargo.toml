@@ -8,11 +8,17 @@ queue and git/GitHub mechanics for AI-agent software delivery. See \
 /agent-fleet-manager-spec.md for the full specification.
 """
 license = "Apache-2.0"
-repository = "https://github.com/rustyrazorblade/skills"
+repository = "https://github.com/rustyrazorblade/spec-flow"
+homepage = "https://github.com/rustyrazorblade/spec-flow"
 publish = false
 
 # `cargo doc` renders the crate doc comment in `src/lib.rs`; keep this in
 # sync with the design note there rather than duplicating it here.
+
+# `publish = false` above (this isn't going to crates.io) also hides the
+# binary from `dist`'s auto-detection; opt back in explicitly.
+[package.metadata.dist]
+dist = true
 
 [[bin]]
 name = "spec-flow"
@@ -101,3 +107,8 @@ rmcp = { version = "3.1", features = [
   "transport-streamable-http-client-reqwest",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
