@@ -29,9 +29,22 @@
 //! [`crate::state::drift`] and [`crate::merge`] already cover those on
 //! their own terms; duplicating them into board rows would just be two
 //! sources of truth for the same fact.
+//!
+//! # The backlog view (§6, §2.7)
+//!
+//! [`build_backlog`] is the same kind of pure aggregation over the same
+//! [`IssueSnapshot`]s, for §6's other board-family read tool: the
+//! **not-yet-`ready`** issues, each annotated with its readiness gap. It
+//! lives here rather than in a module of its own because it is a
+//! *projection of the same input* — every backlog row's issue is also a
+//! board row's issue (both start from the project's open issues), and the
+//! backlog's narrower column set exists precisely so a coordinator that
+//! wants the rest calls `board`, not so this module can hold two
+//! divergent copies of one row shape.
 
 use crate::state::{IssueSnapshot, Priority};
 use crate::vcs::{IssueRelationships, IssueState, PullRequestStatus};
+use crate::workflow::{WorkflowConfig, handoff_ready_reached, readiness_gap};
 
 /// One row of the board (§13). Carries the raw ingredients for the
 /// clickable GitHub link §15 requires every rendered issue reference to
@@ -126,6 +139,130 @@ pub fn build_board(
         .collect();
     rows.sort_by_key(|row| row.number);
     rows
+}
+
+/// One row of the backlog (§6 `backlog`, §2.7) — a **not-yet-`ready`**
+/// issue and what it still needs to clear the §7.2 ph.5 handoff bar.
+///
+/// Deliberately narrower than [`BoardRow`]: §6 asks this tool for "the
+/// prioritized not-yet-`ready` issues, each annotated with its readiness
+/// gap," and every backlog issue is by construction also a board issue
+/// (both views start from the project's open issues), so a coordinator
+/// that wants owner/dependency/PR columns for one of these calls `board`
+/// or `issue` rather than having them duplicated here. What is *not*
+/// duplicated is also what cannot go stale between the two views.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BacklogRow {
+    /// The issue number.
+    pub number: u64,
+    /// The issue title.
+    pub title: String,
+    /// The issue's GitHub URL — see [`issue_url`]; §15 requires every
+    /// rendered issue reference to be a clickable link.
+    pub url: String,
+    /// The current workflow phase, from `IssueSnapshot::status`. `None`
+    /// for an issue that carries no status label at all — still being
+    /// groomed (§7.2 ph.1), and the most backlog-shaped state there is.
+    pub status: Option<String>,
+    /// The issue's priority, from `IssueSnapshot::priority` — the field
+    /// this view is ordered by (§2.7's "surface next by priority").
+    pub priority: Option<Priority>,
+    /// Phases already approved on this issue (§4.3), carried alongside
+    /// [`Self::readiness_gap`] so a coordinator can see what the gap is
+    /// measured against without a second call.
+    pub approvals: Vec<String>,
+    /// Which approvals this issue still needs to reach `status:ready`
+    /// (§7.2 ph.5), from [`crate::workflow::readiness_gap`] — bare
+    /// approval keys, in the order the workflow declares them.
+    ///
+    /// **Empty is meaningful, not a filler value**: it usually means the
+    /// design package is fully approved and the issue is waiting only to
+    /// be stamped `status:ready` — exactly the row §2.7's queue-filling
+    /// loop wants at the top of its worklist, which is why membership in
+    /// this view is decided by
+    /// [`crate::workflow::handoff_ready_reached`] (a status question) and
+    /// not by "has a non-empty gap" (an approvals question).
+    ///
+    /// One degenerate case reads the same way without meaning it: a
+    /// workflow that declares no `status:ready` handoff seam at all (see
+    /// [`crate::workflow::readiness_gap`]'s doc) reports every row's gap
+    /// as empty, because there is no approval bar to measure one against
+    /// — not because every issue is actually ready. The shipped default
+    /// always declares the seam, so this only bites a team-edited
+    /// `workflow.yaml` that removed it.
+    pub readiness_gap: Vec<String>,
+}
+
+/// Build the backlog (§6 `backlog`, §2.7): one [`BacklogRow`] per **open,
+/// not-yet-`ready`** snapshot, ordered highest-priority first.
+///
+/// Membership is [`crate::workflow::handoff_ready_reached`] against
+/// `workflow` — see that function for why the test is positional over the
+/// team's own `labels.status` and what it does with a status the workflow
+/// never defines. Closed issues are dropped outright: this row shape
+/// carries no `state` column (unlike [`BoardRow`]), so a closed issue
+/// could only appear here as a silently wrong entry in a worklist of work
+/// still to do — the same reason [`crate::schedule::Candidate`]'s doc
+/// gives for excluding them, resolved here rather than pushed onto the
+/// caller since this function *can* see the state.
+///
+/// # Ordering
+///
+/// Priority first (`P0`…`P3`, unlabelled last), then ascending issue
+/// number. That is §12's tiers 3 and 4 — the two that mean anything for
+/// pre-`ready` work — using the same conventions
+/// `crate::schedule` already fixed: `None` priority ranks *below* every
+/// labelled one rather than above, and a lower issue number is the age
+/// proxy (GitHub numbers issues monotonically per repo, and
+/// [`crate::vcs::IssueRef`] carries no `created_at` to prefer).
+///
+/// §12's other two tiers are deliberately not applied. **Actionable-now**
+/// (tier 1) needs each issue's claim liveness and dependency-merge state,
+/// which the scheduler takes as caller-computed booleans and which no
+/// phase engine exists here to supply; more to the point, it answers
+/// "which issue should an agent be spawned on," while this view exists
+/// for the issues that are *not* ready to be spawned on at all.
+/// **Furthest-along** (tier 2) is already carried per row as the
+/// readiness gap itself, at finer resolution than a phase rank: two
+/// issues both at `status:architecture` differ by which approvals have
+/// landed, which the gap shows and a phase rank does not.
+pub fn build_backlog(
+    snapshots: &[IssueSnapshot],
+    workflow: &WorkflowConfig,
+    repo: &str,
+    host: Option<&str>,
+) -> Vec<BacklogRow> {
+    let mut rows: Vec<BacklogRow> = snapshots
+        .iter()
+        .filter(|snapshot| matches!(snapshot.state, IssueState::Open))
+        .filter(|snapshot| {
+            !handoff_ready_reached(workflow, snapshot.status.as_deref())
+        })
+        .map(|snapshot| BacklogRow {
+            number: snapshot.number,
+            title: snapshot.title.clone(),
+            url: issue_url(repo, host, snapshot.number),
+            status: snapshot.status.clone(),
+            priority: snapshot.priority,
+            approvals: snapshot.approvals.clone(),
+            readiness_gap: readiness_gap(workflow, snapshot),
+        })
+        .collect();
+    rows.sort_by_key(|row| (priority_rank(row.priority), row.number));
+    rows
+}
+
+/// This priority's sort rank — lower sorts first (`P0` highest), and an
+/// unlabelled issue ranks below every labelled one.
+///
+/// The same rule `crate::schedule`'s own (private) `priority_rank`
+/// applies for §12 tier 3; duplicated as four lines rather than made
+/// `pub(crate)` there, because the scheduler's version is one tier of a
+/// candidate comparison that also consults facts this module has no
+/// business gathering — sharing the function would tie this view to that
+/// signature for no gain.
+fn priority_rank(priority: Option<Priority>) -> u8 {
+    priority.map_or(4, |p| p as u8)
 }
 
 #[cfg(test)]
@@ -260,5 +397,134 @@ mod tests {
     #[test]
     fn build_board_is_empty_for_no_snapshots() {
         assert!(build_board(&[], "owner/repo-a", None).is_empty());
+    }
+
+    // -- build_backlog --
+
+    /// The shipped default workflow (§11.3) — the same config a freshly
+    /// `init`ed project runs, so these assertions pin the real
+    /// `product-spec`/`architecture`/`test-plan` bar rather than a
+    /// fixture invented here.
+    fn workflow() -> crate::workflow::WorkflowConfig {
+        crate::workflow::parse_workflow(crate::scaffold::DEFAULT_WORKFLOW_YAML)
+            .unwrap()
+    }
+
+    fn at(number: u64, status: Option<&str>) -> IssueSnapshot {
+        let mut snap = snapshot(number, "t");
+        snap.status = status.map(|s| s.to_string());
+        snap
+    }
+
+    #[test]
+    fn build_backlog_keeps_only_the_issues_before_the_ready_seam() {
+        let snapshots = vec![
+            at(1, None),
+            at(2, Some("architecture")),
+            at(3, Some("ready")),
+            at(4, Some("implement")),
+            at(5, Some("done")),
+        ];
+
+        let backlog = build_backlog(&snapshots, &workflow(), "o/r", None);
+
+        let numbers: Vec<u64> = backlog.iter().map(|row| row.number).collect();
+        assert_eq!(numbers, vec![1, 2]);
+    }
+
+    #[test]
+    fn build_backlog_annotates_each_row_with_what_it_still_needs() {
+        let mut snap = at(1, Some("test-plan"));
+        snap.approvals = vec!["product-spec".to_string()];
+
+        let backlog = build_backlog(&[snap], &workflow(), "o/r", None);
+
+        assert_eq!(backlog[0].approvals, vec!["product-spec".to_string()]);
+        assert_eq!(
+            backlog[0].readiness_gap,
+            vec!["architecture".to_string(), "test-plan".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_backlog_keeps_a_fully_approved_issue_that_is_not_stamped_ready() {
+        // The row §2.7's queue-filling loop most wants: the design
+        // package is complete, only the `status:ready` stamp is missing.
+        // An empty gap must not be mistaken for "not backlog work".
+        let mut snap = at(1, Some("test-plan"));
+        snap.approvals = vec![
+            "product-spec".to_string(),
+            "architecture".to_string(),
+            "test-plan".to_string(),
+        ];
+
+        let backlog = build_backlog(&[snap], &workflow(), "o/r", None);
+
+        assert_eq!(backlog.len(), 1);
+        assert!(backlog[0].readiness_gap.is_empty());
+    }
+
+    #[test]
+    fn build_backlog_orders_by_priority_then_issue_number() {
+        let mut p2 = at(1, Some("product-spec"));
+        p2.priority = Some(Priority::P2);
+        let mut p0 = at(2, Some("product-spec"));
+        p0.priority = Some(Priority::P0);
+        let mut p0_later = at(3, Some("product-spec"));
+        p0_later.priority = Some(Priority::P0);
+
+        let backlog =
+            build_backlog(&[p2, p0_later, p0], &workflow(), "o/r", None);
+
+        let numbers: Vec<u64> = backlog.iter().map(|row| row.number).collect();
+        assert_eq!(numbers, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn build_backlog_ranks_an_unlabelled_priority_last_not_first() {
+        // `Option<Priority>`'s derived ordering would put `None` first
+        // (highest); §12 tier 3 wants the opposite.
+        let unlabelled = at(1, Some("product-spec"));
+        let mut p3 = at(2, Some("product-spec"));
+        p3.priority = Some(Priority::P3);
+
+        let backlog =
+            build_backlog(&[unlabelled, p3], &workflow(), "o/r", None);
+
+        let numbers: Vec<u64> = backlog.iter().map(|row| row.number).collect();
+        assert_eq!(numbers, vec![2, 1]);
+    }
+
+    #[test]
+    fn build_backlog_omits_a_closed_issue() {
+        // A `BacklogRow` has no `state` column, so a closed issue could
+        // only appear here as a wrong entry in a worklist of work still
+        // to do -- see `build_backlog`'s doc.
+        let mut closed = at(1, Some("architecture"));
+        closed.state = IssueState::Closed;
+
+        assert!(build_backlog(&[closed], &workflow(), "o/r", None).is_empty());
+    }
+
+    #[test]
+    fn build_backlog_threads_the_host_override_into_every_url() {
+        let backlog = build_backlog(
+            &[at(42, Some("architecture"))],
+            &workflow(),
+            "owner/repo-a",
+            Some("github.example.com"),
+        );
+
+        assert_eq!(
+            backlog[0].url,
+            "https://github.example.com/owner/repo-a/issues/42"
+        );
+    }
+
+    #[test]
+    fn build_backlog_is_empty_for_no_snapshots() {
+        assert!(
+            build_backlog(&[], &workflow(), "owner/repo-a", None).is_empty()
+        );
     }
 }

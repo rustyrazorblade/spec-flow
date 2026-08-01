@@ -150,6 +150,19 @@ pub fn find_dependency_cycles(
             }
         }
     }
+    // `edges.keys()` iterates a `HashMap` in an order that varies across
+    // process runs, so with two or more distinct cycles the loop above
+    // would otherwise report them in a different relative order every
+    // time — a caller diffing successive reports would see phantom
+    // churn. Each cycle's own representation is already canonical
+    // (rotated to its lowest issue, see `canonicalize`); sorting the
+    // whole list by that representation (not just its first element,
+    // which two distinct cycles can share) makes the list itself
+    // deterministic too.
+    findings.sort_by_key(|finding| match finding {
+        DriftFinding::DependencyCycle { cycle } => cycle.clone(),
+        _ => unreachable!("this function only ever produces DependencyCycle"),
+    });
     findings
 }
 

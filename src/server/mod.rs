@@ -1,9 +1,11 @@
 /*! The MCP daemon itself (§2.5, §5, §6, §14) — `spec-flow serve`.
 
-This is the first slice of §6's tool surface: the async foundation
-(`tokio` + `rmcp` over streamable HTTP/SSE, loopback), plus the three
-read-only tools that make a coordinator session possible at all —
-`register`, `board`, and `issue`.
+This is §6's tool surface as far as it is built: the async foundation
+(`tokio` + `rmcp` over streamable HTTP/SSE, loopback), plus **every
+read-only tool under §6's "Board / status" heading** — `register`,
+`board`, `issue`, `backlog`, and `drift`. All five re-derive their
+answer from GitHub on every call (§2.3); none of them writes anything,
+to GitHub or to disk.
 
 # The connection *is* the project (§2.5, §6, §15)
 
@@ -45,28 +47,55 @@ the obvious candidate — it is already a per-request-presentable secret,
 unlike a coordinator's `cwd`), and that is a design decision for the
 step that needs it.
 
-# What this slice deliberately does not implement
+# What this server deliberately does not implement
 
 Not stubs — absent, and listed here so nobody has to grep for them. Every
-other §6 tool: `next_assignment`, `backlog`, `drift`, `start_implement`,
-`submit_artifact`, `submit_review`, `create_issue`, `advance`,
-`cancel_work`, `sync_ci`, `address`, `approve`, `set_gate`, `link`,
-`unlink`, `acquire_lease`/`heartbeat_lease`/`release_lease`/
-`lease_status`, `report`, and `instructions`. `init` stays a CLI
-subcommand here rather than an MCP tool (§14.1 ships it as one); wiring
-it as a tool too is a later decision, not an omission with a workaround.
+write-path §6 tool: `start_implement`, `submit_artifact`,
+`submit_review`, `create_issue`, `advance`, `cancel_work`, `sync_ci`,
+`address`, `approve`, `set_gate`, `link`, `unlink`,
+`acquire_lease`/`heartbeat_lease`/`release_lease`/`lease_status`,
+`report`, and `instructions`. `init` stays a CLI subcommand here rather
+than an MCP tool (§14.1 ships it as one); wiring it as a tool too is a
+later decision, not an omission with a workaround.
 
 Also absent, and each for a stated reason:
 
+- **`next_assignment`** (§6) — the one read-shaped tool still missing.
+  It returns "the highest-value content phase awaiting an agent per the
+  scheduling order (§12)", which is [`crate::schedule::next_action`]'s
+  job, and that function's tier-1 input is each issue's *actionability*:
+  gate not parked on a human, `requires` satisfied, not already
+  claimed/running. Two of those three come from the phase engine and the
+  live [`crate::ProcessSpawner`] map, neither of which runs alongside
+  this server — the same boundary [`crate::board`]'s own doc draws for
+  the `next_action` column it likewise omits. §6 also scopes it across
+  the fleet's whole scheduling context, which a connection bound to one
+  project (§2.5) does not have. A `next_assignment` computed from the
+  slice of that available here would hand an agent work it may not be
+  clear to start, which is worse than not answering.
 - **`register`'s spawned-phase path** (§2.6's `spawn_token`). Presenting
   a token is *rejected*, not ignored — see
   [`logic::ToolError::SpawnTokenUnsupported`]. There is nothing to bind a
   token to: no spawner is running alongside this server to have minted
   one, and no `submit_artifact` exists for it to gate.
-- **`board`'s `filter` argument** (§6). Likewise rejected rather than
-  ignored: §6 gives `filter` no shape, so silently returning an
-  unfiltered board to a client that asked for a filtered one would be a
-  wrong answer dressed as a right one.
+- **`board`'s and `backlog`'s `filter` arguments** (§6). Likewise
+  rejected rather than ignored (see
+  [`logic::ToolError::BoardFilterUnsupported`] and
+  [`logic::ToolError::BacklogFilterUnsupported`], one variant each so the
+  rejection names the tool the client actually called): §6 gives `filter`
+  no shape for either, so silently returning an unfiltered list to a
+  client that asked for a filtered one would be a wrong answer dressed as
+  a right one.
+- **Three of §12's six drift kinds** — a status label disagreeing with
+  reality, an orphaned worktree, an implemented branch with no PR.
+  `drift` reports the six checks [`crate::state::drift`] implements;
+  those three compare GitHub against this instance's own worktree/phase
+  bookkeeping, which does not exist yet (that module's doc has the full
+  reasoning). `drift`'s *contention* half is likewise partial: it reports
+  who holds each work-claim (§8.2), but not lease holders/queues (§8.3),
+  since this crate has no lease model at all (§16 item 5 — see
+  [`crate::merge`]'s doc for the same open question blocking the
+  serialized merge fallback).
 - **`board`'s WIP-vs-`max_concurrent_agents` count and its single
   recommended `next_action`** (§6, §2.7). WIP needs this instance's live
   [`crate::ProcessSpawner`] `LocalProcess` map, which nothing runs
@@ -75,7 +104,10 @@ Also absent, and each for a stated reason:
   omits. `next_action` needs [`crate::schedule::next_action`], which
   needs each issue's *actionability* from the phase engine; wiring the
   scheduler into the server is a step of its own, and a `next_action`
-  computed from a partial view would be worse than none.
+  computed from a partial view would be worse than none. Note this is
+  only the *WIP* half of §2.7's loop: its other half — "surface the
+  highest-priority backlog issues and what detail each is still
+  missing" — is exactly what `backlog` now answers.
 - **`instance_id` auto-generation on first `serve`** (§11.1, and
   [`crate::GlobalConfig::instance_id`]'s doc, which names `serve` as its
   home). Nothing in this slice writes a claim, so nothing needs an
@@ -83,12 +115,19 @@ Also absent, and each for a stated reason:
   read-only server would be an unrequested config mutation.
 - **The CI/PR poller** (§12) and any background task at all. This server
   is purely request-driven; `serve` starts a listener and nothing else.
-- **Any caching or request batching.** `board` re-reads every open issue
-  from GitHub on every call, one `gh` subprocess at a time. This is
-  measurably slow — see [`logic::read_board`]'s "Cost" section for the
-  number measured against a live repo and for why neither fix (§2.3/§5's
-  disposable local cache, or a batched GraphQL read) is tuning that
-  belongs in this slice.
+- **Any caching or request batching.** `board`, `backlog`, and `drift`
+  each re-read every open issue from GitHub on every call, one `gh`
+  subprocess at a time — and `drift` adds one more per off-board
+  dependency. This is measurably slow, not theoretically: all three
+  measured **49 `gh` subprocesses and ~20 seconds** against a live
+  16-open-issue repo (see [`logic::read_board`]'s, [`logic::read_backlog`]'s
+  and [`logic::read_drift`]'s "Cost" sections, the last of which is also
+  explicit about which part of it the measurement did *not* exercise).
+  Neither fix (§2.3/§5's disposable local cache, or a batched GraphQL
+  read) is tuning that belongs in a read-only slice.
+  Nor is the workflow file [`backlog`](SpecFlowServer::backlog) parses
+  per call cached — see `logic`'s `load_workflow` for why re-reading a
+  file a team edits mid-session is the point, not an oversight.
 */
 
 mod logic;
@@ -112,12 +151,13 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use crate::config::{GlobalConfig, ProjectConfig};
 use crate::vcs::ShellVcs;
 
-pub use self::logic::ToolError;
+pub use self::logic::{ClaimHolder, DriftReport, ToolError};
 pub use self::wire::{
-    BoardArgs, BoardResult, BoardRowWire, CiConclusionWire, ClaimWire,
-    IssueArgs, IssueResult, IssueStateWire, PriorityWire,
-    PullRequestStateWire, PullRequestStatusWire, RegisterArgs, RegisterResult,
-    RelationshipsWire,
+    BacklogArgs, BacklogResult, BacklogRowWire, BoardArgs, BoardResult,
+    BoardRowWire, CiConclusionWire, ClaimHolderWire, ClaimWire,
+    DriftFindingWire, DriftResult, IssueArgs, IssueResult, IssueStateWire,
+    PriorityWire, PullRequestStateWire, PullRequestStatusWire, RegisterArgs,
+    RegisterResult, RelationshipsWire,
 };
 
 /// The HTTP path the MCP endpoint is mounted at.
@@ -127,7 +167,7 @@ pub use self::wire::{
 /// a full URL anyway.
 pub const MCP_PATH: &str = "/mcp";
 
-/// How many open issues one `board` call will page in.
+/// How many open issues one open-issue-paging read tool will page in.
 ///
 /// A constant, not a config knob, because §6's `board(filter?)` is the
 /// place paging/filtering belongs and that argument is unimplemented
@@ -136,6 +176,13 @@ pub const MCP_PATH: &str = "/mcp";
 /// generous next to the `max_concurrent_agents` handful a fleet actually
 /// works at once, and a repo that exceeds it gets
 /// [`BoardResult::truncated`] rather than a quietly short board.
+///
+/// Named for `board`, the tool that introduced it. `backlog` and `drift`
+/// page the same open-issue list through the same cap rather than each
+/// inventing a differently-tuned one: all three answer questions about
+/// "this project's open issues," and a fleet where `drift` scanned a
+/// different slice of the repo than `board` displayed would make the two
+/// answers impossible to reconcile.
 pub const BOARD_ISSUE_LIMIT: u32 = 200;
 
 /// The MCP protocol revisions this server advertises.
@@ -296,6 +343,36 @@ impl SpecFlowServer {
         self.issue_inner(args).await.map(Json).map_err(tool_error)
     }
 
+    /// `backlog(filter?)` (§6, §2.7) — the queue-filling worklist for
+    /// the connection's bound project.
+    #[tool(description = "The prioritized not-yet-ready issues in this \
+                       connection's project, each annotated with the \
+                       approvals it still needs to reach status:ready \
+                       — the queue-filling worklist.")]
+    pub async fn backlog(
+        &self,
+        Parameters(args): Parameters<BacklogArgs>,
+    ) -> Result<Json<BacklogResult>, ErrorData> {
+        self.backlog_inner(args).await.map(Json).map_err(tool_error)
+    }
+
+    /// `drift()` (§6, §12) — drift + contention for the connection's
+    /// bound project.
+    ///
+    /// No arguments at all, matching §6's own `drift()`: the project
+    /// rides the connection (§2.5), and every check runs over the whole
+    /// project by definition.
+    #[tool(description = "Current drift and contention for this \
+                       connection's project: dependency cycles, \
+                       dependencies on closed or missing issues, stale \
+                       claims, merged PRs against open issues, \
+                       ambiguous labels, multiple open linked PRs, and \
+                       who currently holds each work-claim. Surfaced, \
+                       never auto-fixed.")]
+    pub async fn drift(&self) -> Result<Json<DriftResult>, ErrorData> {
+        self.drift_inner().await.map(Json).map_err(tool_error)
+    }
+
     // -- tool bodies, split out so the `?` operator is usable and the
     //    error mapping happens in exactly one place per tool --
 
@@ -426,6 +503,68 @@ impl SpecFlowServer {
         ))
     }
 
+    async fn backlog_inner(
+        &self,
+        args: BacklogArgs,
+    ) -> Result<BacklogResult, ToolError> {
+        if args.filter.is_some() {
+            return Err(ToolError::BacklogFilterUnsupported);
+        }
+        let bound = self.bound_project()?;
+        let vcs = Arc::clone(&self.shared.vcs);
+
+        // Same read-the-binding-once discipline as `board_inner`: the
+        // rows are fetched against `for_task`'s repo, so the reported
+        // project must be that same capture, not a re-read.
+        let for_task = bound.clone();
+        let (rows, truncated) = blocking(move || {
+            logic::read_backlog(
+                vcs.as_ref(),
+                &for_task.config,
+                BOARD_ISSUE_LIMIT,
+            )
+        })
+        .await?;
+
+        Ok(BacklogResult {
+            project: bound.name,
+            repo: bound.config.repo,
+            rows: rows.iter().map(Into::into).collect(),
+            issue_limit: BOARD_ISSUE_LIMIT,
+            truncated,
+        })
+    }
+
+    async fn drift_inner(&self) -> Result<DriftResult, ToolError> {
+        let bound = self.bound_project()?;
+        let vcs = Arc::clone(&self.shared.vcs);
+        // §11.1's operator-configured heartbeat TTL, and this call's own
+        // "now" — both captured here rather than inside
+        // `logic::read_drift` so staleness stays testable without a
+        // clock (the same split `find_stale_claims` itself uses).
+        let ttl = self.shared.global.claim.heartbeat_ttl;
+        let now = std::time::SystemTime::now();
+
+        let for_task = bound.clone();
+        let report = blocking(move || {
+            logic::read_drift(
+                vcs.as_ref(),
+                &for_task.config,
+                BOARD_ISSUE_LIMIT,
+                ttl,
+                now,
+            )
+        })
+        .await?;
+
+        Ok(DriftResult::from_report(
+            &report,
+            &bound.name,
+            &bound.config.repo,
+            BOARD_ISSUE_LIMIT,
+        ))
+    }
+
     /// This connection's bound project, or [`ToolError::NotRegistered`].
     fn bound_project(&self) -> Result<BoundProject, ToolError> {
         self.lock_bound().clone().ok_or(ToolError::NotRegistered)
@@ -515,11 +654,19 @@ fn tool_error(error: ToolError) -> ErrorData {
         | ToolError::CwdNotAbsolute { .. }
         | ToolError::UnregisteredDirectory { .. }
         | ToolError::SpawnTokenUnsupported
-        | ToolError::BoardFilterUnsupported => {
+        | ToolError::BoardFilterUnsupported
+        | ToolError::BacklogFilterUnsupported => {
             ErrorData::invalid_params(message, None)
         }
         ToolError::NotRegistered | ToolError::AlreadyBound { .. } => {
             ErrorData::invalid_request(message, None)
+        }
+        // A missing or malformed `.spec-flow/workflow.yaml` is the
+        // machine's problem, not the call's — same side of `tool_error`'s
+        // "fix your call vs. fix your machine" split as a config or `gh`
+        // failure, and the chain carries the path and the parse error.
+        ToolError::ReadWorkflow { .. } | ToolError::Workflow { .. } => {
+            ErrorData::internal_error(format_chain(&error), None)
         }
         ToolError::Config(_) | ToolError::Vcs(_) => {
             // The source chain carries the actual `gh` stderr / config
@@ -657,6 +804,7 @@ mod tests {
             ),
             (ToolError::SpawnTokenUnsupported, "invalid_params"),
             (ToolError::BoardFilterUnsupported, "invalid_params"),
+            (ToolError::BacklogFilterUnsupported, "invalid_params"),
             (ToolError::NotRegistered, "invalid_request"),
             (
                 ToolError::AlreadyBound {
@@ -690,6 +838,31 @@ mod tests {
         assert_eq!(
             tool_error(error).code,
             rmcp::model::ErrorCode::INTERNAL_ERROR
+        );
+    }
+
+    #[test]
+    fn tool_error_maps_an_unreadable_workflow_file_to_internal_error() {
+        // A missing or malformed `.spec-flow/workflow.yaml` is not the
+        // caller's argument mistake -- `backlog` takes no path -- so it
+        // belongs on the "fix your machine" side of the split, with the
+        // offending path preserved in the message.
+        let error = ToolError::ReadWorkflow {
+            path: std::path::PathBuf::from("/p/main/.spec-flow/workflow.yaml"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such file",
+            ),
+        };
+
+        let mapped = tool_error(error);
+
+        assert_eq!(mapped.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert!(
+            mapped.message.contains("workflow.yaml")
+                && mapped.message.contains("no such file"),
+            "the message must name the file and its cause: {}",
+            mapped.message
         );
     }
 

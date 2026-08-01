@@ -303,24 +303,155 @@ fn advance_from_ready(
     workflow: &WorkflowConfig,
     ctx: &RequirementContext<'_>,
 ) -> AdvanceDecision {
-    let unknown =
-        || AdvanceDecision::UnknownPhase { status: READY_STATUS.to_string() };
-    let Some(ready_index) =
-        workflow.labels.status.iter().position(|s| s == READY_STATUS)
-    else {
-        return unknown();
-    };
-    let Some(next_status) = workflow.labels.status.get(ready_index + 1) else {
-        return unknown();
-    };
-    match workflow
+    match ready_target_phase(workflow) {
+        Some(target) => advance_into(target, ctx),
+        None => {
+            AdvanceDecision::UnknownPhase { status: READY_STATUS.to_string() }
+        }
+    }
+}
+
+/// Where [`READY_STATUS`] sits in `workflow.labels.status`, or `None` for
+/// a workflow that declares no `ready` entry at all — one with no handoff
+/// seam (§7.2 ph.5) for anything to be before or after.
+fn ready_index(workflow: &WorkflowConfig) -> Option<usize> {
+    workflow.labels.status.iter().position(|s| s == READY_STATUS)
+}
+
+/// The phase the `ready` alias hands off to: the phase whose
+/// [`Phase::status_label`] is the status positioned immediately after
+/// `ready` in `workflow.labels.status` (`implement`, in the shipped
+/// default).
+///
+/// Shared by [`advance_from_ready`] (which enters it) and
+/// [`readiness_gap`] (which reads its entry conditions), so those two can
+/// never disagree about which phase the handoff seam actually leads to.
+/// See [`advance_from_ready`]'s doc for why this resolution is positional
+/// rather than inferred from any phase's `requires` shape.
+///
+/// `None` when the workflow declares no `ready` status, when `ready` is
+/// the last entry in `labels.status`, or when no phase claims the status
+/// that follows it — the three ways a config can leave the seam
+/// unresolvable, all of which [`advance`] reports as
+/// [`AdvanceDecision::UnknownPhase`].
+fn ready_target_phase(workflow: &WorkflowConfig) -> Option<&Phase> {
+    let ready_index = ready_index(workflow)?;
+    let next_status = workflow.labels.status.get(ready_index + 1)?;
+    workflow
         .phases
         .iter()
         .find(|phase| phase.status_label.as_deref() == Some(next_status))
-    {
-        Some(target) => advance_into(target, ctx),
-        None => unknown(),
+}
+
+/// Whether `status` has reached the `status:ready` handoff seam (§7.2
+/// ph.5) — `true` for `ready` itself and for every status positioned
+/// after it in `workflow.labels.status`.
+///
+/// This is the membership test §6's `backlog(filter?)` is defined by
+/// ("the prioritized **not-yet-`ready`** issues"): an open issue is
+/// backlog work exactly when this returns `false`. It is positional,
+/// against the same ordered `labels.status` list `ready_target_phase`
+/// resolves the alias with — not a hard-coded phase list, and
+/// deliberately *not* a re-reading of the approval labels, which
+/// [`readiness_gap`] answers separately. Keeping the two orthogonal is
+/// what lets an issue carrying every required approval but not yet
+/// stamped `status:ready` appear in the backlog with an **empty gap** —
+/// precisely the "this one is ready to hand off" signal §2.7's
+/// queue-filling loop looks for.
+///
+/// Two cases resolve to `false` on purpose rather than erroring:
+///
+/// - **No status label at all** (`None`) — an issue still being groomed
+///   (§7.2 ph.1) has not reached anything.
+/// - **A status this workflow does not define** — it cannot be placed
+///   relative to the seam, so it stays in the coordinator's worklist
+///   instead of silently vanishing from a read path (§15's "surface,
+///   don't bury"). Diagnosing that status is [`advance`]'s job
+///   ([`AdvanceDecision::UnknownPhase`]), not this function's.
+///
+/// A workflow whose `labels.status` carries no `ready` entry has no
+/// handoff seam, so nothing can be past one and every status but a
+/// literal `ready` returns `false`. The visible consequence — every open
+/// issue shows up as backlog — is the honest reading of a config that
+/// never declares the seam, and better than silently reporting an empty
+/// backlog for it.
+pub fn handoff_ready_reached(
+    workflow: &WorkflowConfig,
+    status: Option<&str>,
+) -> bool {
+    let Some(status) = status else { return false };
+    if status == READY_STATUS {
+        return true;
     }
+    let Some(ready_index) = ready_index(workflow) else { return false };
+    match workflow.labels.status.iter().position(|s| s == status) {
+        Some(index) => index > ready_index,
+        None => false,
+    }
+}
+
+/// Which approvals `snapshot` still needs to reach the `status:ready`
+/// handoff seam (§7.2 ph.5) — §6 `backlog`'s **readiness gap**.
+///
+/// Derived from the workflow's own entry conditions for the phase the
+/// `ready` alias hands off to (`ready_target_phase` — `implement` in
+/// the shipped default): every [`Requirement::Approved`] in that phase's
+/// `requires` list whose key is not already in
+/// [`IssueSnapshot::approvals`], in the order the config declares them.
+/// The returned strings are bare approval keys (`"architecture"`), the
+/// same form `approvals` itself carries — not full `approved:*` label
+/// names.
+///
+/// # Why the config, and not the three names §6 spells out
+///
+/// §6 describes the gap as "which of {acceptance-criteria, architecture,
+/// test-plan} approvals it still needs" — but the shipped default
+/// (`crate::scaffold::DEFAULT_WORKFLOW_YAML`) names that first phase
+/// `product-spec`, not `acceptance-criteria`, and §7.2 ph.5 describes the
+/// same bar in prose ("testable acceptance criteria (product-spec) **+**
+/// a chosen architecture **+** an approved test plan"). Two spellings of
+/// one triple is itself the evidence that this set is config-derived
+/// rather than a constant to hard-code — §7.0 makes the phase list a
+/// committed repo file a team reorders, adds to, or removes from. Reading
+/// the seam target's `requires` reproduces §6's triple exactly for the
+/// shipped default while staying correct for a team that has edited it.
+///
+/// # Why `requires`, and not "every earlier phase with an `approval_label`"
+///
+/// The other plausible derivation — walk the phases before the seam and
+/// collect their `approval_label`s — reports approvals nothing actually
+/// checks. A phase configured `gate: auto` still carries its
+/// `approval_label` (the label an explicit `approve` grant would write),
+/// but [`super::gate::is_phase_clear`] treats `auto` as clear *without*
+/// that label, so an issue would sit in the backlog advertising a gap it
+/// never needs to close and the coordinator would chase an approval the
+/// workflow does not want. `requires` is the machine-checked condition
+/// [`advance`] itself evaluates before entering the phase, which is what
+/// "not yet ready" means operationally.
+///
+/// Returns empty both when every required approval is already present and
+/// when the seam's target phase cannot be resolved at all (see
+/// `ready_target_phase`) — the latter being a config that declares no
+/// handoff, and so has no approval bar to report a gap against.
+pub fn readiness_gap(
+    workflow: &WorkflowConfig,
+    snapshot: &IssueSnapshot,
+) -> Vec<String> {
+    let Some(target) = ready_target_phase(workflow) else {
+        return Vec::new();
+    };
+    target
+        .requires
+        .iter()
+        .filter_map(|requirement| match requirement {
+            Requirement::Approved(key)
+                if !snapshot.approvals.iter().any(|a| a == key) =>
+            {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Check whether `next` is clear to enter — its `requires` always, and
@@ -1230,5 +1361,197 @@ mod tests {
             op,
             LabelOp { label: "gate:architecture".to_string(), present: false }
         );
+    }
+
+    // -- handoff_ready_reached (§6 `backlog`'s membership test) --
+
+    /// The shipped default, unmodified — the config every assertion
+    /// about the real `product-spec`/`architecture`/`test-plan` triple
+    /// must run against.
+    fn shipped() -> WorkflowConfig {
+        parse_workflow(crate::scaffold::DEFAULT_WORKFLOW_YAML).unwrap()
+    }
+
+    #[test]
+    fn handoff_ready_reached_is_false_for_every_status_before_the_seam() {
+        let workflow = shipped();
+
+        for status in
+            ["product-spec", "conflict-check", "architecture", "test-plan"]
+        {
+            assert!(
+                !handoff_ready_reached(&workflow, Some(status)),
+                "{status} sits before `ready` in the shipped default"
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_ready_reached_is_true_at_the_seam_and_past_it() {
+        let workflow = shipped();
+
+        for status in ["ready", "implement", "review", "done"] {
+            assert!(
+                handoff_ready_reached(&workflow, Some(status)),
+                "{status} is at or past `ready` in the shipped default"
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_ready_reached_is_false_for_an_unlabelled_issue() {
+        // §7.2 ph.1: an issue still being groomed carries no status
+        // label at all, and is the most backlog-shaped thing there is.
+        assert!(!handoff_ready_reached(&shipped(), None));
+    }
+
+    #[test]
+    fn handoff_ready_reached_is_false_for_a_status_this_workflow_never_defines()
+     {
+        // An unplaceable status keeps the issue in the coordinator's
+        // worklist rather than disappearing from every read path
+        // (§15) -- see this function's doc.
+        assert!(!handoff_ready_reached(&shipped(), Some("triage")));
+    }
+
+    #[test]
+    fn handoff_ready_reached_follows_a_teams_reordered_status_vocabulary() {
+        // The property that makes this positional rather than
+        // hard-coded: a team that moves the seam earlier gets a
+        // correspondingly smaller backlog, with no code change.
+        let mut workflow = shipped();
+        workflow.labels.status = vec![
+            "product-spec".to_string(),
+            "ready".to_string(),
+            "architecture".to_string(),
+        ];
+
+        assert!(!handoff_ready_reached(&workflow, Some("product-spec")));
+        assert!(handoff_ready_reached(&workflow, Some("architecture")));
+    }
+
+    #[test]
+    fn handoff_ready_reached_still_recognizes_a_literal_ready_label_with_no_seam_declared()
+     {
+        // A workflow with no `ready` entry declares no seam, so nothing
+        // can be *past* one -- but an issue literally labelled
+        // `status:ready` has plainly reached it, and must not be
+        // reported as backlog work.
+        let mut workflow = shipped();
+        workflow.labels.status =
+            vec!["product-spec".to_string(), "implement".to_string()];
+
+        assert!(handoff_ready_reached(&workflow, Some("ready")));
+        assert!(!handoff_ready_reached(&workflow, Some("implement")));
+    }
+
+    // -- readiness_gap (§6 `backlog`'s annotation) --
+
+    #[test]
+    fn readiness_gap_on_a_fresh_issue_is_the_shipped_defaults_full_triple() {
+        // §6's "{acceptance-criteria, architecture, test-plan}" as the
+        // shipped default actually spells it (§7.2 ph.5) -- pinned to
+        // the config, not to a constant in this crate.
+        let workflow = shipped();
+
+        let gap = readiness_gap(&workflow, &snapshot(Some("product-spec")));
+
+        assert_eq!(
+            gap,
+            vec![
+                "product-spec".to_string(),
+                "architecture".to_string(),
+                "test-plan".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn readiness_gap_drops_each_approval_as_it_lands() {
+        let workflow = shipped();
+        let mut snap = snapshot(Some("test-plan"));
+        snap.approvals =
+            vec!["product-spec".to_string(), "architecture".to_string()];
+
+        let gap = readiness_gap(&workflow, &snap);
+
+        assert_eq!(gap, vec!["test-plan".to_string()]);
+    }
+
+    #[test]
+    fn readiness_gap_is_empty_once_the_whole_design_package_is_approved() {
+        // §7.2 ph.5's handoff bar met -- the issue is ready to be
+        // stamped `status:ready` even though it still carries an
+        // earlier status label.
+        let workflow = shipped();
+        let mut snap = snapshot(Some("test-plan"));
+        snap.approvals = vec![
+            "product-spec".to_string(),
+            "architecture".to_string(),
+            "test-plan".to_string(),
+        ];
+
+        assert!(readiness_gap(&workflow, &snap).is_empty());
+    }
+
+    #[test]
+    fn readiness_gap_ignores_non_approval_requirements_of_the_seam_target() {
+        // The seam target's `requires` can mix kinds (`{ci: green}`,
+        // `deps_merged`); only the approval ones are a *readiness* gap
+        // a coordinator can close by grooming.
+        let mut workflow = shipped();
+        let implement = workflow
+            .phases
+            .iter_mut()
+            .find(|phase| phase.id == "implement")
+            .unwrap();
+        implement.requires = vec![
+            Requirement::DepsMerged,
+            Requirement::Approved("architecture".to_string()),
+            Requirement::Ci("green".to_string()),
+        ];
+
+        let gap = readiness_gap(&workflow, &snapshot(Some("product-spec")));
+
+        assert_eq!(gap, vec!["architecture".to_string()]);
+    }
+
+    #[test]
+    fn readiness_gap_is_empty_when_the_workflow_declares_no_handoff_seam() {
+        // No `ready` in `labels.status` -> no seam -> no approval bar to
+        // measure a gap against. Empty, not a panic and not the shipped
+        // default's triple smuggled in as a fallback.
+        let mut workflow = shipped();
+        workflow.labels.status =
+            vec!["product-spec".to_string(), "implement".to_string()];
+
+        assert!(
+            readiness_gap(&workflow, &snapshot(Some("product-spec")))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn readiness_gap_follows_the_seam_when_a_team_moves_it() {
+        // The same positional resolution `advance_from_ready` uses: move
+        // `ready` and the gap becomes the *new* target phase's approval
+        // requirements, with no code change.
+        let mut workflow = shipped();
+        workflow.labels.status = vec![
+            "product-spec".to_string(),
+            "ready".to_string(),
+            "review".to_string(),
+        ];
+        let review = workflow
+            .phases
+            .iter_mut()
+            .find(|phase| phase.id == "review")
+            .unwrap();
+        review.requires =
+            vec![Requirement::Approved("product-spec".to_string())];
+
+        let gap = readiness_gap(&workflow, &snapshot(Some("product-spec")));
+
+        assert_eq!(gap, vec!["product-spec".to_string()]);
     }
 }

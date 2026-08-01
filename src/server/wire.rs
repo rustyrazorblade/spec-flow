@@ -23,12 +23,15 @@
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::board::BoardRow;
+use crate::board::{BacklogRow, BoardRow};
+use crate::state::drift::DriftFinding;
 use crate::state::{IssueSnapshot, Priority};
 use crate::vcs::{
     CiConclusion, IssueRelationships, IssueState, PullRequestState,
     PullRequestStatus,
 };
+
+use super::logic::{ClaimHolder, DriftReport};
 
 // ---------------------------------------------------------------------
 // register (§6 "Registration & lifecycle")
@@ -211,6 +214,211 @@ pub struct IssueResult {
 }
 
 // ---------------------------------------------------------------------
+// backlog (§6 "Board / status", §2.7)
+// ---------------------------------------------------------------------
+
+/// Arguments to `backlog(filter?)` (§6, §2.7).
+#[derive(Clone, Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct BacklogArgs {
+    /// **Unimplemented.** §6 gives this argument no shape, exactly as it
+    /// gives `board`'s none — and here the plausible readings diverge
+    /// even further (a priority floor? a readiness-gap predicate? a
+    /// label expression?). Accepted so a client passing one is rejected
+    /// rather than silently handed the whole backlog while believing it
+    /// asked for a slice of it; see [`BoardArgs::filter`] and
+    /// `src/server/mod.rs`'s module doc for the same stance applied to
+    /// `board`.
+    #[serde(default)]
+    pub filter: Option<String>,
+}
+
+/// The prioritized not-yet-`ready` worklist (§6, §2.7) for the
+/// connection's bound project.
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+pub struct BacklogResult {
+    /// The bound project's handle.
+    pub project: String,
+
+    /// The bound project's repo slug.
+    pub repo: String,
+
+    /// One row per open, not-yet-`ready` issue, highest priority first
+    /// ([`crate::board::build_backlog`]).
+    pub rows: Vec<BacklogRowWire>,
+
+    /// How many open issues the server was willing to page in
+    /// ([`crate::BOARD_ISSUE_LIMIT`]) before filtering down to the
+    /// not-yet-`ready` ones.
+    pub issue_limit: u32,
+
+    /// Whether the repo had at least `issue_limit` **open** issues, i.e.
+    /// whether issues that would have belonged on this backlog were
+    /// never read at all. Note this is a property of the open-issue read,
+    /// not of `rows`: a backlog far shorter than `issue_limit` can still
+    /// be truncated. Reported for the same §15 reason `board` reports it,
+    /// with more at stake — a silently short backlog reads as "there is
+    /// no prepared work left," which is the exact conclusion §2.7's
+    /// coordinator acts on.
+    pub truncated: bool,
+}
+
+/// One backlog row (§6, §2.7) — the wire form of [`BacklogRow`].
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+pub struct BacklogRowWire {
+    /// The issue number (scoped to `repo`, §15).
+    pub number: u64,
+    /// The issue title.
+    pub title: String,
+    /// The issue's GitHub URL, for §15's mandatory clickable
+    /// `[#N (title)](url)` rendering.
+    pub url: String,
+    /// The current workflow phase (`status:<phase>`), or `null` for an
+    /// issue that carries no status label yet (§7.2 ph.1).
+    pub status: Option<String>,
+    /// The issue's priority label, if any — what these rows are ordered
+    /// by (§2.7's "surface next by priority").
+    pub priority: Option<PriorityWire>,
+    /// Phases already approved on this issue (§4.3).
+    pub approvals: Vec<String>,
+    /// Which approvals this issue still needs to reach `status:ready`
+    /// (§7.2 ph.5) — §6's **readiness gap**. Bare approval keys
+    /// (`"architecture"`), matching `approvals`' own form.
+    ///
+    /// An empty list does **not** mean "nothing to do": it usually means
+    /// the design package is complete and the issue is waiting only to
+    /// be stamped `status:ready` — the highest-value row in this whole
+    /// answer for §2.7's queue-filling loop. The one exception is a
+    /// `workflow.yaml` edited to remove the `status:ready` seam
+    /// entirely, in which case every row's gap reads empty because there
+    /// is no bar left to measure against (see
+    /// [`crate::board::BacklogRow::readiness_gap`]'s doc).
+    pub readiness_gap: Vec<String>,
+}
+
+// ---------------------------------------------------------------------
+// drift (§6 "Board / status", §12)
+// ---------------------------------------------------------------------
+
+/// The drift + contention picture (§6 `drift()`, §12) for the
+/// connection's bound project.
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+pub struct DriftResult {
+    /// The bound project's handle.
+    pub project: String,
+
+    /// The bound project's repo slug.
+    pub repo: String,
+
+    /// Every drift finding, across all six checks
+    /// `crate::state::drift` implements. **Surfaced, never auto-fixed**
+    /// (§12, §15) — this is a report, not a plan.
+    pub findings: Vec<DriftFindingWire>,
+
+    /// Who currently holds a claim on which issue (§8.2) — the
+    /// *contention* half of §6's bullet. Stale claims appear here
+    /// **and** in `findings`; see [`ClaimHolderWire::stale`].
+    pub claims: Vec<ClaimHolderWire>,
+
+    /// How many open issues the server was willing to page in
+    /// ([`crate::BOARD_ISSUE_LIMIT`]).
+    pub issue_limit: u32,
+
+    /// Whether the repo had at least `issue_limit` open issues, i.e.
+    /// whether drift may exist on issues this scan never read (§15's
+    /// "surface, don't bury" — a truncated clean report is not a clean
+    /// repo).
+    pub truncated: bool,
+}
+
+/// One drift finding (§12) — the wire form of [`DriftFinding`].
+///
+/// Internally tagged on `kind` rather than serialized as serde's default
+/// externally-tagged `{"DependencyCycle": {...}}`: a client matching on
+/// `finding.kind` needs one stable field to switch on, not a
+/// single-key object whose key *is* the discriminant.
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DriftFindingWire {
+    /// A `blockedBy` cycle (§8.4).
+    DependencyCycle {
+        /// The issues in the cycle, in traversal order, rotated to start
+        /// at the lowest-numbered issue.
+        cycle: Vec<u64>,
+    },
+    /// An issue blocked on a closed issue (§8.4).
+    DependencyOnClosedIssue {
+        /// The issue carrying the dependency.
+        issue: u64,
+        /// The closed issue it depends on.
+        depends_on: u64,
+    },
+    /// An issue blocked on an issue that could not be found (§8.4) —
+    /// deleted, transferred, never real, **or** unreadable at scan time;
+    /// see `server::logic`'s `read_drift` doc for why this
+    /// transport cannot separate the last case from the first three.
+    DependencyOnMissingIssue {
+        /// The issue carrying the dependency.
+        issue: u64,
+        /// The issue number it depends on, which could not be found.
+        depends_on: u64,
+    },
+    /// A work-claim whose heartbeat has gone silent past the TTL (§8.2).
+    StaleClaim {
+        /// The issue whose claim is stale.
+        issue: u64,
+        /// The instance that held it.
+        instance: String,
+        /// The claim's last heartbeat, as a Unix timestamp in seconds.
+        epoch: u64,
+    },
+    /// A merged pull request against a still-open issue (§12) — usually
+    /// a PR body that never carried `Closes #N`.
+    MergedPrWithOpenIssue {
+        /// The open issue.
+        issue: u64,
+        /// The pull request that merged without closing it.
+        pull_request: u64,
+    },
+    /// An issue carrying more than one `status:*` or `owner:*@*` label
+    /// (§4.3, §8.2) — the daemon still resolves it deterministically,
+    /// but the ambiguity is reported rather than swallowed.
+    AmbiguousLabels {
+        /// The issue carrying more than one match.
+        issue: u64,
+        /// The label prefix that matched more than once (`"status:"` or
+        /// `"owner:"`).
+        prefix: String,
+        /// Every matching label, in the order `gh` returned them.
+        labels: Vec<String>,
+    },
+    /// An issue with more than one simultaneously **open** linked pull
+    /// request — a §4.1 1:1:1:1 deviation.
+    MultipleOpenLinkedPullRequests {
+        /// The issue.
+        issue: u64,
+        /// Every open linked PR's number.
+        pull_requests: Vec<u64>,
+    },
+}
+
+/// One instance's live hold on an issue (§8.2) — the wire form of
+/// [`ClaimHolder`].
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+pub struct ClaimHolderWire {
+    /// The claimed issue.
+    pub issue: u64,
+    /// The claiming instance's id (`instance_id`, §11.1).
+    pub instance: String,
+    /// The claim heartbeat's Unix timestamp, in seconds.
+    pub epoch: u64,
+    /// Whether this claim has lapsed past the configured TTL — the same
+    /// verdict the matching [`DriftFindingWire::StaleClaim`] carries,
+    /// denormalized onto the claim so a client can render "who holds
+    /// what, and is it alive" without joining two lists.
+    pub stale: bool,
+}
+
+// ---------------------------------------------------------------------
 // Shared leaf shapes
 // ---------------------------------------------------------------------
 
@@ -378,6 +586,107 @@ impl From<&BoardRow> for BoardRowWire {
             owner: row.owner.clone(),
             relationships: (&row.relationships).into(),
             pull_request: row.pull_request.map(Into::into),
+        }
+    }
+}
+
+impl From<&BacklogRow> for BacklogRowWire {
+    fn from(row: &BacklogRow) -> BacklogRowWire {
+        BacklogRowWire {
+            number: row.number,
+            title: row.title.clone(),
+            url: row.url.clone(),
+            status: row.status.clone(),
+            priority: row.priority.map(Into::into),
+            approvals: row.approvals.clone(),
+            readiness_gap: row.readiness_gap.clone(),
+        }
+    }
+}
+
+impl From<&DriftFinding> for DriftFindingWire {
+    // Exhaustive on purpose despite `DriftFinding` being
+    // `#[non_exhaustive]`: that attribute constrains *other* crates, and
+    // this one is the same crate — so a seventh drift kind added to
+    // `state::drift` fails to compile here until it is given a wire
+    // shape, instead of silently disappearing from every `drift()`
+    // answer behind a catch-all arm.
+    fn from(finding: &DriftFinding) -> DriftFindingWire {
+        match finding {
+            DriftFinding::DependencyCycle { cycle } => {
+                DriftFindingWire::DependencyCycle { cycle: cycle.clone() }
+            }
+            DriftFinding::DependencyOnClosedIssue { issue, depends_on } => {
+                DriftFindingWire::DependencyOnClosedIssue {
+                    issue: *issue,
+                    depends_on: *depends_on,
+                }
+            }
+            DriftFinding::DependencyOnMissingIssue { issue, depends_on } => {
+                DriftFindingWire::DependencyOnMissingIssue {
+                    issue: *issue,
+                    depends_on: *depends_on,
+                }
+            }
+            DriftFinding::StaleClaim { issue, instance, epoch } => {
+                DriftFindingWire::StaleClaim {
+                    issue: *issue,
+                    instance: instance.clone(),
+                    epoch: *epoch,
+                }
+            }
+            DriftFinding::MergedPrWithOpenIssue { issue, pull_request } => {
+                DriftFindingWire::MergedPrWithOpenIssue {
+                    issue: *issue,
+                    pull_request: *pull_request,
+                }
+            }
+            DriftFinding::AmbiguousLabels { issue, prefix, labels } => {
+                DriftFindingWire::AmbiguousLabels {
+                    issue: *issue,
+                    prefix: (*prefix).to_string(),
+                    labels: labels.clone(),
+                }
+            }
+            DriftFinding::MultipleOpenLinkedPullRequests {
+                issue,
+                pull_requests,
+            } => DriftFindingWire::MultipleOpenLinkedPullRequests {
+                issue: *issue,
+                pull_requests: pull_requests.clone(),
+            },
+        }
+    }
+}
+
+impl From<&ClaimHolder> for ClaimHolderWire {
+    fn from(holder: &ClaimHolder) -> ClaimHolderWire {
+        ClaimHolderWire {
+            issue: holder.issue,
+            instance: holder.claim.instance.clone(),
+            epoch: holder.claim.epoch,
+            stale: holder.stale,
+        }
+    }
+}
+
+impl DriftResult {
+    /// Project a [`DriftReport`] onto the wire, tagging it with the
+    /// connection's bound project (§2.5 — `drift()` takes no `project`
+    /// argument because the project rides the connection).
+    pub fn from_report(
+        report: &DriftReport,
+        project: &str,
+        repo: &str,
+        issue_limit: u32,
+    ) -> DriftResult {
+        DriftResult {
+            project: project.to_string(),
+            repo: repo.to_string(),
+            findings: report.findings.iter().map(Into::into).collect(),
+            claims: report.claims.iter().map(Into::into).collect(),
+            issue_limit,
+            truncated: report.truncated,
         }
     }
 }

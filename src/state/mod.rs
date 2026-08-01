@@ -276,6 +276,25 @@ pub fn read_issue_state<V: Vcs>(
     repo: &str,
     issue_number: u64,
 ) -> Result<IssueSnapshot, VcsError> {
+    read_issue_state_with_labels(vcs, repo, issue_number)
+        .map(|(_labels, snapshot)| snapshot)
+}
+
+/// [`read_issue_state`]'s exact call sequence, with the issue's raw
+/// `labels` also returned alongside the derived [`IssueSnapshot`].
+///
+/// Exists so a caller needing both (`server::logic::read_drift`'s
+/// [`drift::find_ambiguous_labels`] check, which counts literal label
+/// matches that the derived snapshot has already collapsed) does not
+/// have to choose between a second `gh` round trip and a hand-copied
+/// duplicate of this function's body — [`read_issue_state`] itself is
+/// now a thin wrapper over this, so the two can never silently diverge
+/// in which calls they make.
+pub(crate) fn read_issue_state_with_labels<V: Vcs>(
+    vcs: &V,
+    repo: &str,
+    issue_number: u64,
+) -> Result<(Vec<String>, IssueSnapshot), VcsError> {
     let issue = vcs.read_issue(repo, issue_number)?;
     let relationships = vcs.read_relationships(repo, issue_number)?;
     let linked = vcs.find_linked_pull_requests(repo, issue_number)?;
@@ -284,7 +303,9 @@ pub fn read_issue_state<V: Vcs>(
         pull_requests.push(vcs.read_pull_request_status(repo, pr.number)?);
     }
 
-    Ok(derive_issue_state(&issue, &relationships, pull_requests))
+    let labels = issue.labels.clone();
+    let snapshot = derive_issue_state(&issue, &relationships, pull_requests);
+    Ok((labels, snapshot))
 }
 
 /// The most relevant of an issue's (possibly several) linked pull

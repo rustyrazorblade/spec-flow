@@ -5,8 +5,11 @@
 //! This module owns exactly the **static, declarative** side of the
 //! workflow engine — what a phase is, what it requires, and what gate it
 //! carries. The **dynamic** side — gate evaluation, `requires` checking,
-//! the review-panel/fix-loop primitive, and `advance`/`approve`/
-//! `set_gate` as plain functions — lives in this module's siblings
+//! the review-panel/fix-loop primitive, `advance`/`approve`/
+//! `set_gate` as plain functions, and the two read-only views of the
+//! same `status:ready` handoff seam `advance` already resolves
+//! ([`handoff_ready_reached`], [`readiness_gap`] — what §6's `backlog`
+//! tool is defined in terms of) — lives in this module's siblings
 //! ([`gate`], [`requires`], [`panel`], [`advance`]), each following the
 //! same "pure function over already-known facts" shape
 //! [`crate::schedule`] and [`crate::state::derive_issue_state`] already
@@ -38,7 +41,8 @@ mod requires;
 use serde::{Deserialize, Deserializer};
 
 pub use advance::{
-    AdvanceDecision, ApproveDecision, LabelOp, advance, approve, set_gate,
+    AdvanceDecision, ApproveDecision, LabelOp, advance, approve,
+    handoff_ready_reached, readiness_gap, set_gate,
 };
 pub use gate::{GateMode, effective_gate_mode, gate_clear, is_phase_clear};
 pub use panel::{

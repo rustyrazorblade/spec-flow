@@ -37,11 +37,11 @@ callers write `spec_flow::GlobalConfig`, not
 | `spawner/` | The `claude` process spawner + `LocalProcess` map ([`ProcessSpawner`]): command-template interpolation, spawn/track/reap, same-instance double-spawn blocking (§2.6, §4.2, §5) | Implemented (step 3). No MCP server or phase engine exists yet, so nothing in this crate calls it — a later step (§14 step 6+) wires it into the phase engine. |
 | `claim.rs` | Work-claiming (§8.2, §14 step 5): [`write_claim`]/[`confirm_claim`], the two-step optimistic claim + settle-read; heartbeat refresh and an instance's own stale-claim reclaim are just `write_claim` called again | Implemented (step 5) against the [`Vcs`] trait's existing `read_issue`/`set_label` — no new `Vcs` method was needed. Staleness itself is [`state::drift::find_stale_claims`]'s job, not this module's. **Unresolved architectural conflict, confirmed not just suspected** (see `vcs::shell::ShellVcs::set_label`'s doc): `gh issue edit --add-label` cannot add a label name that doesn't already exist in the repo, but every `write_claim` heartbeat mints a brand-new `owner:<instance>@<epoch>` label name — the claim protocol as specified (§8.2) cannot work against real GitHub through this transport as shipped. Needs a design decision before `serve` (§14 step 6+) relies on it. |
 | `schedule.rs` | The scheduler's default ordering (§12, §14 step 5): the pure [`schedule::next_action`]/[`schedule::schedule_order`] functions (actionable-now → furthest-along → priority → age) | Implemented (step 5) over the shipped-default [`schedule::DEFAULT_PHASE_ORDER`] (§7.2) — see its module doc for what's deferred: a workflow-config-defined phase order, a "dependency" tie-break ahead of age, and the CI/PR poller's backoff loop (all §14 step 6+ or later). Step 10 added the cross-project layer on top: [`schedule::next_action_across_projects`] picks *which project* gets a freed spawn slot before applying the existing within-project order — smooth weighted round-robin ([`schedule::FairShareState`], [`CrossProjectMode::FairShare`], the shipped default) or a flat global ranking across every project's issues ([`CrossProjectMode::GlobalPriorityPool`]). Needed two new [`ProjectConfig`]/[`GlobalConfig`] fields ([`ProjectConfig::weight`], [`GlobalConfig::cross_project_mode`]). |
-| `workflow/` | The workflow-config data model + parser (§7, §14 step 7): [`workflow::WorkflowConfig`] and its nested types, deserialized straight from `scaffold::DEFAULT_WORKFLOW_YAML`; gate evaluation ([`workflow::gate_clear`] and friends, §2.3b/§4.3); `requires` evaluation ([`workflow::requirement_satisfied`], §7.1); the review-panel/bounded-fix-loop decision primitive ([`workflow::evaluate_panel`], §7.1); and `advance`/`approve`/`set_gate` as plain, pure functions (§6) | Implemented (step 7) as pure data + pure functions only — see the module's own doc for exactly what is and is not covered; no phase engine, spawner wiring, or MCP server calls any of it yet. Step 9 added [`workflow::label_vocabulary`] (every GitHub label name the config actually uses), consumed by `init`. |
+| `workflow/` | The workflow-config data model + parser (§7, §14 step 7): [`workflow::WorkflowConfig`] and its nested types, deserialized straight from `scaffold::DEFAULT_WORKFLOW_YAML`; gate evaluation ([`workflow::gate_clear`] and friends, §2.3b/§4.3); `requires` evaluation ([`workflow::requirement_satisfied`], §7.1); the review-panel/bounded-fix-loop decision primitive ([`workflow::evaluate_panel`], §7.1); `advance`/`approve`/`set_gate` as plain, pure functions (§6); and the two read-only views of the `status:ready` handoff seam ([`workflow::handoff_ready_reached`], [`workflow::readiness_gap`]) that §6's `backlog` is defined by | Implemented (step 7) as pure data + pure functions only — see the module's own doc for exactly what is and is not covered; no phase engine, spawner wiring, or MCP server calls any of it yet. Step 9 added [`workflow::label_vocabulary`] (every GitHub label name the config actually uses), consumed by `init`. |
 | `merge.rs` | Merge-queue integration (§8.1, §14 step 8): [`merge::plan_merge`] (gate → enqueue, native mode) and [`merge::observe_merge`] (observe) as pure functions | Implemented (step 8) for the **native** merge queue only — see the module's own doc for why the serialized fallback (§8.1's warn-and-degrade path) is a documented, deliberately unresolved gap rather than a guess: it hinges on §8.3's lease model, itself an open question (§16 item 5). `init`'s merge-queue-enabled check (this step's other named deliverable) was already implemented in step 1 (`init::detect_merge_mode`); nothing changed there. |
 | `implement.rs` | `start_implement` kickoff (§10.2, §14 step 9): [`start_implement_setup`] (claim the worktree, read the issue, decide spec-author-vs-skip) and [`finish_implement_setup`] (commit the spec if one was authored, push, post the dev plan) as two `Vcs`-touching orchestration functions | Implemented (step 9) for the mechanics either side of the spawned spec-authoring agent §10.2 places between them — the actual spawn is a future step's job (no spawner wiring exists yet). Does not itself claim the issue; that's `crate::claim`'s job, called before this module. |
-| `board.rs` | Board rendering (§13, §14 step 9): [`build_board`], a pure aggregation of [`IssueSnapshot`]s into [`BoardRow`]s, and [`issue_url`] (deterministically derived, no `Vcs` round trip) | Implemented (step 9) for every column derivable from GitHub state alone (phase, owner, gates/approvals, PR signals) — see the module's own doc for why the **worktree** and per-agent columns §13 also names are deliberately absent: that data lives in `spawner::ProcessSpawner`'s in-memory map, which nothing in this crate runs alongside the GitHub-state layer yet. Step 11 gave it its first caller: `server/`'s `board` MCP tool. |
-| `server/` | The MCP daemon itself (§2.5, §5, §6, §14): [`serve`] (bind loopback, serve MCP over streamable HTTP/SSE until Ctrl-C), [`mcp_service`] (the `tower` service, split out so tests mount it on an ephemeral port), [`SpecFlowServer`] (one `rmcp` handler instance per connection, holding that connection's bound project), the `*Wire`/`*Args`/`*Result` MCP wire shapes, and [`ToolError`] | Implemented (step 11, the first slice of §6) for **three read-only tools only** — `register` (coordinator path: resolve `cwd` to a registered project and bind the connection to it for life, §2.5/§15), `board` (§13, every open issue through [`crate::state::read_issue_state`] into [`build_board`]), and `issue`. This is where `tokio` and `rmcp` enter the crate. Read the module's own doc before extending it: it records the **confirmed** `rmcp`/MCP constraint the per-connection project binding rests on (protocol revision `2026-07-28` removes sessions, so the transport serves it statelessly with a fresh handler per request — this server therefore advertises only the session-bearing revisions), and lists every §6 tool deliberately absent, each with its reason. `board`'s `filter` argument and `register`'s `spawn_token` path are **rejected, not ignored**. |
+| `board.rs` | Board rendering (§13, §14 step 9): [`build_board`], a pure aggregation of [`IssueSnapshot`]s into [`BoardRow`]s; [`build_backlog`], the same aggregation projected onto §6's not-yet-`ready` worklist ([`BacklogRow`]); and [`issue_url`] (deterministically derived, no `Vcs` round trip) | Implemented (step 9) for every column derivable from GitHub state alone (phase, owner, gates/approvals, PR signals) — see the module's own doc for why the **worktree** and per-agent columns §13 also names are deliberately absent: that data lives in `spawner::ProcessSpawner`'s in-memory map, which nothing in this crate runs alongside the GitHub-state layer yet. Step 11 gave it its first caller: `server/`'s `board` MCP tool, then `backlog` (whose rows are ordered by §12's priority/age tiers only — the two tiers that mean anything before an issue is ready to be worked; see [`build_backlog`]'s doc). |
+| `server/` | The MCP daemon itself (§2.5, §5, §6, §14): [`serve`] (bind loopback, serve MCP over streamable HTTP/SSE until Ctrl-C), [`mcp_service`] (the `tower` service, split out so tests mount it on an ephemeral port), [`SpecFlowServer`] (one `rmcp` handler instance per connection, holding that connection's bound project), the `*Wire`/`*Args`/`*Result` MCP wire shapes, and [`ToolError`] | Implemented (step 11) for **§6's read-only tools only** — `register` (coordinator path: resolve `cwd` to a registered project and bind the connection to it for life, §2.5/§15), `board` (§13, every open issue through [`crate::state::read_issue_state`] into [`build_board`]), `issue`, `backlog` (§2.7's queue-filling worklist: the project's *effective* `.spec-flow/workflow.yaml` read off disk per call, then [`build_backlog`]), and `drift` (§12: the first thing in this crate to orchestrate `state::drift`'s six pure checks into one project-wide report, plus the work-claim contention half of §6's bullet — see `logic::read_drift`'s doc for the scope decision that drove it, namely that the open-issue set alone cannot tell a dependency on a *closed* issue from one on a *missing* issue). This is where `tokio` and `rmcp` enter the crate. Read the module's own doc before extending it: it records the **confirmed** `rmcp`/MCP constraint the per-connection project binding rests on (protocol revision `2026-07-28` removes sessions, so the transport serves it statelessly with a fresh handler per request — this server therefore advertises only the session-bearing revisions), and lists every §6 tool deliberately absent, each with its reason. `board`'s and `backlog`'s `filter` arguments and `register`'s `spawn_token` path are **rejected, not ignored**. |
 | `main.rs` (binary, not part of this library) | `clap` CLI wiring, `tracing` setup, `anyhow` error reporting at the top level | Both subcommands are wired: `init` (step 1) and `serve` (step 11 — loads the global config, builds the [`ShellVcs`] from §8.5's configured binary paths, and blocks on [`serve`] inside a runtime it builds itself rather than via `#[tokio::main]`, so `init` pays nothing for an async runtime it never uses). |
 
 # What is deliberately *not* here yet
@@ -88,13 +88,28 @@ deferred pieces, each documented at its own module, none guessed at**:
   boundary `board.rs`'s module doc already draws for the worktree/
   per-agent columns it likewise omits).
 
-- `server/` ships **three of §6's ~24 MCP tools** — `register`
-  (coordinator path only), `board`, and `issue` — and nothing else. The
-  rest are *absent*, not stubbed, and enumerated one by one with their
-  reasons in that module's own doc; the two arguments it accepts but
-  refuses (`board`'s `filter`, `register`'s `spawn_token`) are rejected
-  rather than silently ignored, so no client can mistake an unfiltered
-  board or a coordinator binding for what it asked for. That doc also
+- `server/` ships **five of §6's ~24 MCP tools** — `register`
+  (coordinator path only) plus every read-only tool under §6's "Board /
+  status" heading: `board`, `issue`, `backlog`, and `drift`. The rest are
+  *absent*, not stubbed, and enumerated one by one with their reasons in
+  that module's own doc. The one read-shaped tool still missing is
+  **`next_assignment`**, and it stays missing on purpose: §6 defines it
+  as the next content phase per §12's scheduling order, whose first tier
+  is *actionability* (gate not parked, `requires` satisfied, not already
+  claimed/running) — facts that come from the phase engine and the live
+  [`ProcessSpawner`] map, neither of which runs alongside this server,
+  and from cross-project scheduling context a connection bound to one
+  project does not have. Handing an agent work it may not be clear to
+  start is worse than not answering. The three arguments the server
+  accepts but refuses (`board`'s `filter`, `backlog`'s `filter`,
+  `register`'s `spawn_token`) are rejected rather than silently ignored,
+  so no client can mistake an unfiltered list or a coordinator binding
+  for what it asked for. `drift` likewise reports only the six drift
+  checks `state::drift` actually implements and only the *claim* half of
+  §6's "drift + contention" — the other three §12 drift kinds need
+  worktree/phase bookkeeping that does not exist, and lease
+  holders/queues need §8.3's lease model, still an open question (§16
+  item 5). That doc also
   records the one **confirmed** external constraint this design rests
   on, read out of `rmcp` 3.1.0's own transport source rather than
   assumed: MCP revision `2026-07-28` removes sessions, and the streamable
@@ -104,10 +119,15 @@ deferred pieces, each documented at its own module, none guessed at**:
   and this server advertises only the session-bearing revisions. It
   also records a measured performance problem, not a theoretical one:
   `board` re-reads every open issue from GitHub on every call, one `gh`
-  subprocess at a time — ~20s for a 16-issue repo, ~48 subprocesses —
+  subprocess at a time — ~20s for a 16-issue repo, 49 subprocesses —
   because §2.3/§5's disposable local cache does not exist in this crate
   yet and a batched GraphQL read would be a new `Vcs` method needing its
-  own live schema validation.
+  own live schema validation. `backlog` and `drift` inherit that same
+  fan-out, measured on the same repo in the same run: 49 `gh` subprocesses
+  and ~20s apiece for 16 open issues. `drift` additionally spends one `gh`
+  read per off-board dependency, which that repo (no `blockedBy` edges)
+  never exercised — `logic::read_drift`'s doc says exactly that rather
+  than quoting a number nobody measured.
 
 The crate now has an async runtime and an MCP crate (`tokio` + `rmcp`,
 both entering at `server/`), but still no phase-engine wiring. In
@@ -126,15 +146,20 @@ computes what should happen next, never causes it to happen — see
 unmodeled `deny` re-entry routing and the not-yet-implemented
 `workflows:` map (§7.4's multiple-named-workflows extension point).
 Step 8 (`merge.rs`) stops short of the serialized merge-lease fallback —
-see that module's doc for exactly why. Nothing in `server/` calls
-`claim`, `schedule`, `workflow`, `merge`, `implement`, `instructions`, or
-`spawner` yet: the three tools it ships are read-only, so the modules
-that would need `claim.rs`'s still-unresolved `owner:` label conflict
-(see its row above) settled first are untouched by this slice.
+see that module's doc for exactly why. `server/` now reads from
+`workflow` (`backlog` parses the project's committed `workflow.yaml` for
+its readiness bar) and from `state::drift` (`drift` orchestrates its six
+checks), but still calls nothing in `claim`, `schedule`, `merge`,
+`implement`, `instructions`, or `spawner`: every tool it ships is
+read-only, so the modules that would first need `claim.rs`'s
+still-unresolved `owner:` label conflict (see its row above) settled are
+untouched.
 */
 #![deny(missing_docs)]
 
-pub use crate::board::{BoardRow, build_board, issue_url};
+pub use crate::board::{
+    BacklogRow, BoardRow, build_backlog, build_board, issue_url,
+};
 pub use crate::claim::{ClaimError, ClaimResult, confirm_claim, write_claim};
 pub use crate::config::{
     Binaries, ClaimConfig, ConfigError, CrossProjectMode, GhConfig,
@@ -166,11 +191,12 @@ pub use crate::schedule::{
     ScheduledIssue, next_action, next_action_across_projects, schedule_order,
 };
 pub use crate::server::{
-    BOARD_ISSUE_LIMIT, BoardArgs, BoardResult, BoardRowWire, CiConclusionWire,
-    ClaimWire, IssueArgs, IssueResult, IssueStateWire, MCP_PATH, PriorityWire,
-    PullRequestStateWire, PullRequestStatusWire, RegisterArgs, RegisterResult,
-    RelationshipsWire, ServeError, SpecFlowServer, ToolError, mcp_service,
-    serve,
+    BOARD_ISSUE_LIMIT, BacklogArgs, BacklogResult, BacklogRowWire, BoardArgs,
+    BoardResult, BoardRowWire, CiConclusionWire, ClaimHolder, ClaimHolderWire,
+    ClaimWire, DriftFindingWire, DriftReport, DriftResult, IssueArgs,
+    IssueResult, IssueStateWire, MCP_PATH, PriorityWire, PullRequestStateWire,
+    PullRequestStatusWire, RegisterArgs, RegisterResult, RelationshipsWire,
+    ServeError, SpecFlowServer, ToolError, mcp_service, serve,
 };
 pub use crate::spawner::{
     LocalProcessEntry, ProcessSpawner, SpawnError, SpawnKey, SpawnToken,
@@ -197,9 +223,10 @@ pub use crate::workflow::{
     Requirement, RequirementContext, ReviewFinding, ReviewLensConfig,
     ReviewLensSource, ReviewVerdict, RoborevConfig, RoborevMode, SpecConfig,
     Trigger, WorkflowConfig, WorkflowError, advance, approve,
-    effective_gate_mode, evaluate_panel, gate_clear, is_phase_clear,
-    label_vocabulary, parse_workflow, phase_requirements_satisfied,
-    requirement_satisfied, set_gate,
+    effective_gate_mode, evaluate_panel, gate_clear, handoff_ready_reached,
+    is_phase_clear, label_vocabulary, parse_workflow,
+    phase_requirements_satisfied, readiness_gap, requirement_satisfied,
+    set_gate,
 };
 
 mod board;

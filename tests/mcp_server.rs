@@ -5,8 +5,10 @@
 //! # What this covers that the unit tests cannot
 //!
 //! `src/server/logic.rs`'s unit tests already exercise every tool body
-//! against `FakeVcs`. What they cannot reach is the layer this file
-//! exists for: the `initialize` handshake and protocol negotiation, the
+//! against `FakeVcs` (including `backlog`'s workflow-file read and
+//! `drift`'s off-board dependency fetch). What they cannot reach is the
+//! layer this file exists for: the `initialize` handshake and protocol
+//! negotiation, the
 //! `#[tool_router]`-generated tool table, JSON argument decoding into the
 //! wire types, `Json<T>` structured-output encoding, the `ToolError` →
 //! JSON-RPC error mapping as the *client* observes it, and — the
@@ -15,7 +17,7 @@
 //! `rmcp`'s per-session service factory rather than of any code in this
 //! crate.
 //!
-//! # Why `board`/`issue` are not driven all the way to GitHub here
+//! # Why the read tools are not driven all the way to GitHub here
 //!
 //! [`spec_flow::mcp_service`] takes a concrete
 //! [`spec_flow::ShellVcs`] — the real `git`/`gh` subprocess layer — not
@@ -87,6 +89,35 @@ fn register_project(dir: &Path, name: &str, repo: &str) -> ProjectPointer {
     };
     save_project_config(&project_config_path(dir), &config).unwrap();
     ProjectPointer { name: name.to_string(), project_dir: dir.to_path_buf() }
+}
+
+/// A minimal but schema-valid `.spec-flow/workflow.yaml`, written where
+/// `backlog` looks for it: under the project's **primary checkout**
+/// (`<project_dir>/main`, matching [`register_project`]'s `local_path`),
+/// exactly as `spec-flow init` scaffolds it.
+///
+/// Deliberately carries a real `ready` seam and one approval-gated phase
+/// before it, so the file exercises the shape `backlog` actually reads
+/// rather than being an arbitrary parseable blob — the shipped default
+/// itself is `pub(crate)`, so an integration test cannot reach for it.
+fn scaffold_workflow(dir: &Path) {
+    let workflow = "\
+labels:
+  priority: [P0, P1, P2, P3]
+  status: [product-spec, ready, implement]
+  gate_prefix: \"gate:\"
+  approval_prefix: \"approved:\"
+  owner_prefix: \"owner:\"
+spec: {tool: openspec, optional: true, skip_label: \"spec:skip\"}
+review_panel: []
+fix_loop: {max_rounds: 1, on_exhausted: escalate, on_decision_finding: escalate}
+phases:
+  - {id: product-spec, action: {type: agent, role: product-manager}, gate: human, approval_label: \"approved:product-spec\", status_label: product-spec}
+  - {id: implement, action: {type: server, op: start_implement}, requires: [\"approved:product-spec\"], gate: none, status_label: implement}
+";
+    let spec_flow = dir.join("main").join(".spec-flow");
+    std::fs::create_dir_all(&spec_flow).unwrap();
+    std::fs::write(spec_flow.join("workflow.yaml"), workflow).unwrap();
 }
 
 /// Serve `global` on an ephemeral loopback port and return its address.
@@ -215,11 +246,12 @@ async fn the_server_advertises_exactly_this_slices_tools() {
         .collect();
     names.sort();
 
-    // Pinned deliberately: §6 lists ~24 tools, and this slice ships
-    // three. A fourth appearing here without a matching doc update in
-    // `src/server/mod.rs`'s "what this slice deliberately does not
-    // implement" list is exactly the drift worth failing on.
-    assert_eq!(names, vec!["board", "issue", "register"]);
+    // Pinned deliberately: §6 lists ~24 tools, and this server ships
+    // five -- every read-only tool under §6's "Board / status" heading,
+    // plus `register`. A sixth appearing here without a matching doc
+    // update in `src/server/mod.rs`'s "what this server deliberately
+    // does not implement" list is exactly the drift worth failing on.
+    assert_eq!(names, vec!["backlog", "board", "drift", "issue", "register"]);
 
     client.cancel().await.unwrap();
 }
@@ -582,6 +614,176 @@ async fn issue_reaches_the_git_gh_layer_once_the_connection_is_bound() {
     assert!(
         error_message(&error).contains("spec-flow-no-such-gh-binary"),
         "the failure must be the gh call: {}",
+        error_message(&error)
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn backlog_and_drift_refuse_an_unregistered_connection() {
+    // §15's "project rides the connection": neither tool takes a
+    // project argument, so without a binding there is nothing to act on.
+    let addr = spawn_server(global_config(Vec::new())).await;
+    let client = connect(addr).await;
+
+    let backlog = client
+        .call_tool(call("backlog", serde_json::json!({})))
+        .await
+        .unwrap_err();
+    let drift = client
+        .call_tool(call("drift", serde_json::json!({})))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error_code(&backlog), ErrorCode::INVALID_REQUEST);
+    assert_eq!(error_code(&drift), ErrorCode::INVALID_REQUEST);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn backlog_reaches_the_git_gh_layer_once_the_connection_is_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    scaffold_workflow(tmp.path());
+    let addr = spawn_server(global_config(vec![pointer])).await;
+    let client = connect(addr).await;
+
+    client
+        .call_tool(call(
+            "register",
+            serde_json::json!({
+                "worker_ref": "w",
+                "role": "coordinator",
+                "cwd": tmp.path().to_str().unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let error = client
+        .call_tool(call("backlog", serde_json::json!({})))
+        .await
+        .unwrap_err();
+
+    // The workflow file parsed (that read happens first); the only thing
+    // left failing is the deliberately-missing `gh`.
+    assert_eq!(error_code(&error), ErrorCode::INTERNAL_ERROR);
+    assert!(
+        error_message(&error).contains("spec-flow-no-such-gh-binary"),
+        "the failure must be the gh call, not the workflow read: {}",
+        error_message(&error)
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn backlog_names_the_workflow_file_it_could_not_read() {
+    // The readiness bar is defined by `.spec-flow/workflow.yaml` (§7.0),
+    // so a project whose checkout lacks it must fail loudly and say
+    // which path -- not fall back to the shipped default and report a
+    // readiness bar the team does not use.
+    let tmp = tempfile::tempdir().unwrap();
+    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer])).await;
+    let client = connect(addr).await;
+
+    client
+        .call_tool(call(
+            "register",
+            serde_json::json!({
+                "worker_ref": "w",
+                "role": "coordinator",
+                "cwd": tmp.path().to_str().unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let error = client
+        .call_tool(call("backlog", serde_json::json!({})))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error_code(&error), ErrorCode::INTERNAL_ERROR);
+    assert!(
+        error_message(&error).contains(".spec-flow/workflow.yaml"),
+        "the failure must name the missing file: {}",
+        error_message(&error)
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn backlog_rejects_a_filter_rather_than_silently_ignoring_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    scaffold_workflow(tmp.path());
+    let addr = spawn_server(global_config(vec![pointer])).await;
+    let client = connect(addr).await;
+
+    client
+        .call_tool(call(
+            "register",
+            serde_json::json!({
+                "worker_ref": "w",
+                "role": "coordinator",
+                "cwd": tmp.path().to_str().unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let error = client
+        .call_tool(call("backlog", serde_json::json!({ "filter": "P0" })))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error_code(&error), ErrorCode::INVALID_PARAMS);
+    // The rejection must name the tool the client actually called --
+    // `board(filter)` would send them looking at the wrong call.
+    assert!(
+        error_message(&error).contains("backlog(filter)"),
+        "the rejection must name this tool: {}",
+        error_message(&error)
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn drift_reaches_the_git_gh_layer_once_the_connection_is_bound() {
+    // `drift()` takes no arguments at all (§6) -- the project rides the
+    // connection, and every check runs project-wide by definition.
+    let tmp = tempfile::tempdir().unwrap();
+    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer])).await;
+    let client = connect(addr).await;
+
+    client
+        .call_tool(call(
+            "register",
+            serde_json::json!({
+                "worker_ref": "w",
+                "role": "coordinator",
+                "cwd": tmp.path().to_str().unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let error = client
+        .call_tool(call("drift", serde_json::json!({})))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error_code(&error), ErrorCode::INTERNAL_ERROR);
+    assert!(
+        error_message(&error).contains("spec-flow-no-such-gh-binary"),
+        "the failure must be the gh call, not a wiring mistake: {}",
         error_message(&error)
     );
 
