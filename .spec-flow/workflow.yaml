@@ -1,0 +1,50 @@
+labels:
+  priority: [P0, P1, P2, P3]
+  status:   [product-spec, conflict-check, architecture, test-plan, ready, implement, review, done]
+  gate_prefix:     "gate:"        # gate:<phase> = this phase needs a human on this issue (§4.3)
+  approval_prefix: "approved:"    # approved:<phase>
+  owner_prefix:    "owner:"       # owner:<instance> + heartbeat (§8.2)
+
+roborev:
+  enabled: true
+  mode: gate            # gate = hard `requires` · advisory = surfaced only. Omit block → off.
+
+spec:                          # spec tooling used to AUTO-WRITE the spec in the worktree at implement (§7.2 ph.6)
+  tool: openspec               # openspec | specs_dir | <custom> — CONFIGURABLE; default OpenSpec (detected by init)
+  openspec: {enabled: true}    # when tool=openspec: explore+propose in the worktree
+  specs_dir: specs/            # when tool=specs_dir: a spec file under this dir
+  optional: true               # allow a PER-ISSUE spec skip via the label below (§7.2 ph.6, §10.2)
+  skip_label: "spec:skip"      # present on the issue → implement does branch + PR only, no spec authored;
+                               # the server posts a comment recording the skip (audit trail, §2.3)
+
+# Review lenses (spec-flow's 5-lens panel, §2.6); run in parallel each round, all must approve.
+# A lens is INTERNAL (server spawns it) or EXTERNAL (a configured outside reviewer posts its verdict
+# on the issue/PR; the server reads it via `gh` — §7.4). The fix loop waits for ALL of them.
+review_panel:
+  - {lens: spec,             role: reviewer}
+  - {lens: code-review,      skill: code-review}
+  - {lens: security-review,  skill: security-review}
+  - {lens: test-rigor,       role: test-rigor-reviewer}
+  - {lens: observability,    role: observability-reviewer}
+  # - {lens: external-audit, type: external, source: "review-comment"}   # external reviewer (§7.4)
+
+fix_loop: {max_rounds: 3, on_exhausted: escalate, on_decision_finding: escalate}   # §7.1, §7.2 phase 6
+
+# gate: none | human | auto  (§2.3b). Config sets the DEFAULT; the orchestrator stamps gate:<phase>
+# labels for each `human` phase at issue creation; the operator adds/removes them per issue (§4.3).
+phases:
+  - {id: product-spec,   action: {type: agent, role: product-manager, interactive: true}, artifact: {kind: issue}, gate: human, approval_label: "approved:product-spec", status_label: product-spec}
+  - {id: conflict-check, action: {type: agent, role: spec-conflict},  artifact: {kind: issue_comment, title: "Spec conflict check"}, gate: none, on_conflict: escalate, status_label: conflict-check}
+  - {id: architecture,   action: {type: agent, role: architect},      artifact: {kind: issue_comment, title: "Architecture + trade-offs"}, gate: human, approval_label: "approved:architecture", status_label: architecture}
+  - {id: test-plan,      action: {type: agent, role: test-planner},   artifact: {kind: issue_comment, title: "Test plan"}, gate: human, approval_label: "approved:test-plan", status_label: test-plan}
+  # No standalone spec phase: the approved issue IS the contract (§7.2 ph.5). When product-spec +
+  # architecture + test-plan are all approved, the server marks the issue `status:ready` for handoff.
+  - {id: implement,      action: {type: server_then_agent, op: start_implement, spec_tool: openspec, role: developer, panel: review_panel, fix_loop: fix_loop, then: build-engineer}, requires: ["approved:product-spec", "approved:architecture", "approved:test-plan"], gate: none, status_label: implement}
+  - {id: review,         action: {type: server, op: merge_queue},     requires: [{ci: green}, {roborev: clean}, deps_merged], gate: human, approval_label: "approved:merge", status_label: review}
+  - {id: finalize,       action: {type: server, op: finalize},        gate: none, status_label: done}
+
+out_of_band:
+  # trigger: auto (poller/GitHub event fires it) | operator (explicit tool call only). Both are always
+  # callable explicitly via sync_ci()/address() (§6); `trigger` sets the DEFAULT auto-behavior.
+  - {id: sync-ci, action: {type: server, op: sync_ci},      reenters: implement, trigger: auto}      # red CI → flag tests
+  - {id: address, action: {type: agent,  role: developer},  reenters: review,    trigger: operator}   # PR review comments
