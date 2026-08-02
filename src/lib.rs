@@ -199,8 +199,8 @@ pub use crate::config::{
     Binaries, ClaimConfig, ConfigError, CrossProjectMode, GhConfig,
     GlobalConfig, HarnessConfig, HarnessesConfig, Limits, MergeMode,
     ProjectConfig, ProjectPointer, global_config_path, load_global_config,
-    load_project_config, project_config_path, save_global_config,
-    save_project_config,
+    load_project_config, project_config_path, projects_config_dir,
+    save_global_config, save_project_config,
 };
 pub use crate::implement::{
     SpecDecision, StartImplementSetup, finish_implement_setup,

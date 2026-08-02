@@ -155,7 +155,7 @@ pub enum ToolError {
 
     /// The project's committed `.spec-flow/workflow.yaml` could not be
     /// read. Distinct from [`ToolError::Config`], which is about the
-    /// daemon's own `<project_dir>/config.yaml`: this file lives in the
+    /// project's own machine-local config file: this file lives in the
     /// repo checkout and is the team's, so the fix is a different one
     /// (re-run `spec-flow init`, or check out the primary worktree)
     /// than for a missing daemon config.
@@ -182,7 +182,7 @@ pub enum ToolError {
         source: WorkflowError,
     },
 
-    /// The project's own `<project_dir>/config.yaml` could not be read.
+    /// The project's own config file could not be read.
     #[error(transparent)]
     Config(#[from] ConfigError),
 
@@ -208,6 +208,7 @@ pub enum ToolError {
 /// file for the repo slug every later `gh` call is scoped with (§8.5).
 pub fn resolve_project(
     global: &GlobalConfig,
+    projects_config_dir: &Path,
     cwd: &str,
 ) -> Result<(ProjectPointer, ProjectConfig), ToolError> {
     let path = Path::new(cwd);
@@ -219,8 +220,10 @@ pub fn resolve_project(
         ToolError::UnregisteredDirectory { cwd: cwd.to_string() }
     })?;
 
-    let config =
-        load_project_config(&project_config_path(&pointer.project_dir))?;
+    let config = load_project_config(&project_config_path(
+        projects_config_dir,
+        &pointer.name,
+    ))?;
 
     Ok((pointer.clone(), config))
 }
@@ -1448,11 +1451,18 @@ mod tests {
         }
     }
 
-    /// Write a real `<project_dir>/config.yaml` and return the pointer
-    /// the global registry would hold for it.
-    fn register_on_disk(dir: &Path, name: &str, repo: &str) -> ProjectPointer {
+    /// Write a real project config file under `configs_dir` (keyed by
+    /// `name`, matching where a real server looks) and return the
+    /// pointer the global registry would hold for it.
+    fn register_on_disk(
+        configs_dir: &Path,
+        dir: &Path,
+        name: &str,
+        repo: &str,
+    ) -> ProjectPointer {
         let config = project_config(name, repo, dir);
-        save_project_config(&project_config_path(dir), &config).unwrap();
+        save_project_config(&project_config_path(configs_dir, name), &config)
+            .unwrap();
         ProjectPointer {
             name: name.to_string(),
             project_dir: dir.to_path_buf(),
@@ -1464,11 +1474,13 @@ mod tests {
     #[test]
     fn resolve_project_finds_the_project_the_cwd_sits_directly_in() {
         let tmp = tempfile::tempdir().unwrap();
-        let pointer = register_on_disk(tmp.path(), "proj-a", "owner/repo-a");
+        let pointer =
+            register_on_disk(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
         let global = global_config(vec![pointer]);
 
         let (found, config) =
-            resolve_project(&global, tmp.path().to_str().unwrap()).unwrap();
+            resolve_project(&global, tmp.path(), tmp.path().to_str().unwrap())
+                .unwrap();
 
         assert_eq!(found.name, "proj-a");
         assert_eq!(config.repo, "owner/repo-a");
@@ -1479,12 +1491,14 @@ mod tests {
         // The realistic case (§10.1): a coordinator is opened in
         // `<project_dir>/<branch>`, never in `<project_dir>` itself.
         let tmp = tempfile::tempdir().unwrap();
-        let pointer = register_on_disk(tmp.path(), "proj-a", "owner/repo-a");
+        let pointer =
+            register_on_disk(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
         let global = global_config(vec![pointer]);
         let worktree = tmp.path().join("issue-42-widget-cache");
 
         let (found, _) =
-            resolve_project(&global, worktree.to_str().unwrap()).unwrap();
+            resolve_project(&global, tmp.path(), worktree.to_str().unwrap())
+                .unwrap();
 
         assert_eq!(found.name, "proj-a");
     }
@@ -1497,12 +1511,12 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
         let global = global_config(vec![
-            register_on_disk(&a, "proj-a", "owner/repo-a"),
-            register_on_disk(&b, "proj-b", "owner/repo-b"),
+            register_on_disk(tmp.path(), &a, "proj-a", "owner/repo-a"),
+            register_on_disk(tmp.path(), &b, "proj-b", "owner/repo-b"),
         ]);
 
         let (found, config) =
-            resolve_project(&global, b.to_str().unwrap()).unwrap();
+            resolve_project(&global, tmp.path(), b.to_str().unwrap()).unwrap();
 
         assert_eq!(found.name, "proj-b");
         assert_eq!(config.repo, "owner/repo-b");
@@ -1513,12 +1527,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("a");
         std::fs::create_dir_all(&project).unwrap();
-        let global =
-            global_config(vec![register_on_disk(&project, "a", "o/a")]);
+        let global = global_config(vec![register_on_disk(
+            tmp.path(),
+            &project,
+            "a",
+            "o/a",
+        )]);
         let elsewhere = tmp.path().join("not-a-project");
 
         assert!(matches!(
-            resolve_project(&global, elsewhere.to_str().unwrap()),
+            resolve_project(&global, tmp.path(), elsewhere.to_str().unwrap()),
             Err(ToolError::UnregisteredDirectory { .. })
         ));
     }
@@ -1528,7 +1546,7 @@ mod tests {
         let global = global_config(Vec::new());
 
         assert!(matches!(
-            resolve_project(&global, "/anywhere"),
+            resolve_project(&global, Path::new("/unused"), "/anywhere"),
             Err(ToolError::UnregisteredDirectory { .. })
         ));
     }
@@ -1538,17 +1556,21 @@ mod tests {
         let global = global_config(Vec::new());
 
         assert!(matches!(
-            resolve_project(&global, "some/relative/dir"),
+            resolve_project(
+                &global,
+                Path::new("/unused"),
+                "some/relative/dir"
+            ),
             Err(ToolError::CwdNotAbsolute { .. })
         ));
     }
 
     #[test]
     fn resolve_project_reports_a_registered_project_with_no_config_file() {
-        // The registry is a pointer list (§11.1); a pointer whose
-        // `<project_dir>/config.yaml` was deleted must surface as a
-        // config error, not as "this directory isn't registered" --
-        // those two send the operator to completely different fixes.
+        // The registry is a pointer list (§11.1); a pointer whose own
+        // config file was deleted must surface as a config error, not as
+        // "this directory isn't registered" -- those two send the
+        // operator to completely different fixes.
         let tmp = tempfile::tempdir().unwrap();
         let global = global_config(vec![ProjectPointer {
             name: "proj-a".to_string(),
@@ -1556,7 +1578,7 @@ mod tests {
         }]);
 
         assert!(matches!(
-            resolve_project(&global, tmp.path().to_str().unwrap()),
+            resolve_project(&global, tmp.path(), tmp.path().to_str().unwrap()),
             Err(ToolError::Config(_))
         ));
     }

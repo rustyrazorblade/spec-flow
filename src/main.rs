@@ -98,6 +98,11 @@ fn main() -> anyhow::Result<()> {
                 global.binaries.git.clone(),
                 global.binaries.gh.clone(),
             );
+            let projects_config_dir = spec_flow::projects_config_dir()
+                .context(
+                    "could not locate the per-project config directory \
+                     (~/.config/spec-flow/projects)",
+                )?;
 
             // Built here rather than via `#[tokio::main]` so `init` pays
             // nothing for it -- see this module's doc.
@@ -105,7 +110,11 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()
                 .context("could not start the async runtime")?
-                .block_on(spec_flow::serve(global, vcs))?;
+                .block_on(spec_flow::serve(
+                    global,
+                    vcs,
+                    projects_config_dir,
+                ))?;
             Ok(())
         }
         Command::Init(args) => {

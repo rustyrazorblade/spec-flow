@@ -1,9 +1,10 @@
 //! `spec-flow init` — project registration (§2.5, §6, §11).
 //!
 //! Run inside a repo, `init` is what makes that repo one this daemon
-//! manages: it writes the project's own `<project_dir>/config.yaml`
-//! (`config.rs`), registers the project in the machine-global registry
-//! (`registry.rs`), and scaffolds the repo's committed `.spec-flow/`
+//! manages: it writes the project's own config file (`config.rs`'s
+//! `projects_config_dir`), registers the project in the machine-global
+//! registry (`registry.rs`), and scaffolds the repo's committed
+//! `.spec-flow/`
 //! files — `workflow.yaml` pre-filled with the default spec-flow-sourced
 //! workflow (§7.2) plus one `.spec-flow/instructions/<point>.md` per
 //! injection point (§9.1). It must be idempotent: re-running it inside
@@ -188,21 +189,32 @@ pub fn init<V: Vcs>(vcs: &V, options: InitOptions) -> Result<(), InitError> {
     let repo_dir = std::env::current_dir()
         .map_err(|source| InitError::CurrentDir { source })?;
     let global_config_path = crate::config::global_config_path()?;
-    init_at(vcs, &options, &repo_dir, &global_config_path)
+    let projects_config_dir = crate::config::projects_config_dir()?;
+    init_at(
+        vcs,
+        &options,
+        &repo_dir,
+        &global_config_path,
+        &projects_config_dir,
+    )
 }
 
 /// [`init`] against explicit paths: `repo_dir` is the checkout to
 /// register (normally the working directory), `global_config_path` the
-/// machine-global config to add its registry row to.
+/// machine-global config to add its registry row to, and
+/// `projects_config_dir` where every registered project's own config
+/// file lives (§11.1).
 fn init_at<V: Vcs>(
     vcs: &V,
     options: &InitOptions,
     repo_dir: &Path,
     global_config_path: &Path,
+    projects_config_dir: &Path,
 ) -> Result<(), InitError> {
-    let project_config = resolve_project_config(vcs, options, repo_dir)?;
+    let project_config =
+        resolve_project_config(vcs, options, repo_dir, projects_config_dir)?;
     save_project_config(
-        &project_config_path(&project_config.project_dir),
+        &project_config_path(projects_config_dir, &project_config.name),
         &project_config,
     )?;
 
@@ -292,12 +304,13 @@ fn provision_label_vocabulary<V: Vcs>(
     Ok(())
 }
 
-/// Interrogate `vcs` for everything `<project_dir>/config.yaml` records
-/// about this repo (§8.5, §10.1, §11.1).
+/// Interrogate `vcs` for everything this repo's own config file records
+/// (§8.5, §10.1, §11.1).
 fn resolve_project_config<V: Vcs>(
     vcs: &V,
     options: &InitOptions,
     repo_dir: &Path,
+    projects_config_dir: &Path,
 ) -> Result<ProjectConfig, InitError> {
     let repo = match &options.repo {
         Some(repo) => repo.clone(),
@@ -372,7 +385,7 @@ fn resolve_project_config<V: Vcs>(
     // of the three, so a re-`init` must carry forward whatever the
     // operator already set on this project rather than wiping it back
     // to `None`.
-    let overrides = existing_overrides(&project_dir)?;
+    let overrides = existing_overrides(projects_config_dir, &name)?;
 
     Ok(ProjectConfig {
         name,
@@ -390,7 +403,7 @@ fn resolve_project_config<V: Vcs>(
 }
 
 /// The operator-added-by-hand overrides [`existing_overrides`] reads
-/// back from `<project_dir>/config.yaml`, if a config is there to read.
+/// back from the project's own config file, if one is there to read.
 ///
 /// All fields absent only on a fresh `init` (no file yet) — anything
 /// else that keeps the file from being read is a hard error, not
@@ -403,8 +416,13 @@ struct ExistingOverrides {
     weight: Option<u32>,
 }
 
-/// Read [`ExistingOverrides`] back from `project_dir`'s config file, if
-/// one exists yet.
+/// Read [`ExistingOverrides`] back from `name`'s config file, if one
+/// exists yet.
+///
+/// Keyed by project `name` rather than `project_dir`: a same-name
+/// re-`init` that repoints `project_dir` (see `init_at`'s
+/// `previous_project_dir` handling) is still the same project's config
+/// to carry forward, not a fresh one.
 ///
 /// # Errors
 ///
@@ -419,9 +437,11 @@ struct ExistingOverrides {
 /// before re-running `init`, rather than `init` silently regenerating
 /// over it.
 fn existing_overrides(
-    project_dir: &Path,
+    projects_config_dir: &Path,
+    name: &str,
 ) -> Result<ExistingOverrides, ConfigError> {
-    match load_project_config(&project_config_path(project_dir)) {
+    match load_project_config(&project_config_path(projects_config_dir, name))
+    {
         Ok(existing) => Ok(ExistingOverrides {
             gh: existing.gh,
             harness: existing.harness,
@@ -536,6 +556,7 @@ mod tests {
         repo_dir: PathBuf,
         project_dir: PathBuf,
         global_config_path: PathBuf,
+        projects_config_dir: PathBuf,
         vcs: FakeVcs,
     }
 
@@ -569,6 +590,9 @@ mod tests {
                 global_config_path: root
                     .path()
                     .join("home/.config/spec-flow/config.yaml"),
+                projects_config_dir: root
+                    .path()
+                    .join("home/.config/spec-flow/projects"),
                 _root: root,
                 repo_dir,
                 project_dir,
@@ -586,12 +610,17 @@ mod tests {
                 options,
                 &self.repo_dir,
                 &self.global_config_path,
+                &self.projects_config_dir,
             )
         }
 
+        fn config_path(&self) -> PathBuf {
+            let name = self.project_dir.file_name().unwrap().to_string_lossy();
+            project_config_path(&self.projects_config_dir, &name)
+        }
+
         fn project_config(&self) -> ProjectConfig {
-            load_project_config(&project_config_path(&self.project_dir))
-                .unwrap()
+            load_project_config(&self.config_path()).unwrap()
         }
 
         fn instruction_path(&self, point: &str) -> PathBuf {
@@ -810,12 +839,15 @@ mod tests {
         vcs.merge_queue_enabled_repos.borrow_mut().insert(REPO.to_string());
         let global_config_path =
             root.path().join("home/.config/spec-flow/config.yaml");
+        let projects_config_dir =
+            root.path().join("home/.config/spec-flow/projects");
 
         let error = init_at(
             &vcs,
             &InitOptions::default(),
             &repo_dir,
             &global_config_path,
+            &projects_config_dir,
         )
         .unwrap_err();
 
@@ -825,7 +857,7 @@ mod tests {
         ));
         // Nothing was written: a rejected init must not leave a
         // half-written project config behind.
-        assert!(!project_config_path(&project_dir).exists());
+        assert!(!project_config_path(&projects_config_dir, "repo-a").exists());
     }
 
     #[test]
@@ -846,6 +878,8 @@ mod tests {
         let vcs = seeded_vcs(&repo_dir, REPO);
         let global_config_path =
             root.path().join("home/.config/spec-flow/config.yaml");
+        let projects_config_dir =
+            root.path().join("home/.config/spec-flow/projects");
 
         let error = init_at(
             &vcs,
@@ -855,6 +889,7 @@ mod tests {
             },
             &repo_dir,
             &global_config_path,
+            &projects_config_dir,
         )
         .unwrap_err();
 
@@ -862,8 +897,10 @@ mod tests {
             error,
             InitError::CheckoutNotSiblingOfDefaultBranch { .. }
         ));
-        assert!(!project_config_path(&wrong_project_dir).exists());
-        assert!(!project_config_path(&real_project_dir).exists());
+        // Config storage is keyed by project name, not by either
+        // directory candidate above -- one check now covers what two
+        // did before.
+        assert!(!project_config_path(&projects_config_dir, "repo-a").exists());
     }
 
     #[test]
@@ -877,12 +914,15 @@ mod tests {
         let vcs = seeded_vcs(&repo_dir, REPO);
         let global_config_path =
             root.path().join("home/.config/spec-flow/config.yaml");
+        let projects_config_dir =
+            root.path().join("home/.config/spec-flow/projects");
 
         let error = init_at(
             &vcs,
             &InitOptions { repo: None, project_dir: Some(nonexistent) },
             &repo_dir,
             &global_config_path,
+            &projects_config_dir,
         )
         .unwrap_err();
 
@@ -907,6 +947,8 @@ mod tests {
         let vcs = seeded_vcs(&repo_dir, REPO);
         let global_config_path =
             root.path().join("home/.config/spec-flow/config.yaml");
+        let projects_config_dir =
+            root.path().join("home/.config/spec-flow/projects");
 
         init_at(
             &vcs,
@@ -916,11 +958,15 @@ mod tests {
             },
             &repo_dir,
             &global_config_path,
+            &projects_config_dir,
         )
         .unwrap();
 
-        let config =
-            load_project_config(&project_config_path(&project_dir)).unwrap();
+        let config = load_project_config(&project_config_path(
+            &projects_config_dir,
+            "repo-a",
+        ))
+        .unwrap();
         assert_eq!(config.project_dir, project_dir);
     }
 
@@ -947,6 +993,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         let global_config_path =
             root.path().join("home/.config/spec-flow/config.yaml");
+        let projects_config_dir =
+            root.path().join("home/.config/spec-flow/projects");
 
         let work_project_dir = root.path().join("work/repo-a");
         let work_repo_dir = work_project_dir.join("main");
@@ -957,6 +1005,7 @@ mod tests {
             &InitOptions::default(),
             &work_repo_dir,
             &global_config_path,
+            &projects_config_dir,
         )
         .unwrap();
 
@@ -979,6 +1028,7 @@ mod tests {
             &InitOptions::default(),
             &oss_repo_dir,
             &global_config_path,
+            &projects_config_dir,
         )
         .unwrap();
 
@@ -1018,11 +1068,7 @@ mod tests {
         });
         edited.harness = Some("codex".to_string());
         edited.weight = Some(5);
-        save_project_config(
-            &project_config_path(&fixture.project_dir),
-            &edited,
-        )
-        .unwrap();
+        save_project_config(&fixture.config_path(), &edited).unwrap();
 
         fixture.init().unwrap();
 
@@ -1043,7 +1089,7 @@ mod tests {
         // the moment it printed a warning. It must fail loudly instead,
         // and must not touch the file first.
         write_file(
-            &project_config_path(&fixture.project_dir),
+            &fixture.config_path(),
             "gh: [this is not a project config\n",
         );
 
@@ -1055,8 +1101,7 @@ mod tests {
         // Untouched: a rejected re-init must not overwrite the file it
         // couldn't safely read from.
         assert_eq!(
-            fs::read_to_string(project_config_path(&fixture.project_dir))
-                .unwrap(),
+            fs::read_to_string(fixture.config_path()).unwrap(),
             "gh: [this is not a project config\n"
         );
     }
@@ -1071,7 +1116,7 @@ mod tests {
         fixture.init().unwrap();
         let mut edited = fixture.project_config();
         edited.weight = Some(0);
-        let path = project_config_path(&fixture.project_dir);
+        let path = fixture.config_path();
         save_project_config(&path, &edited).unwrap();
 
         assert!(matches!(

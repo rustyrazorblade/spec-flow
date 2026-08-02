@@ -228,6 +228,35 @@ impl ShellVcs {
         })
     }
 
+    /// Run a `gh <noun> list --json ...` style `program` and deserialize
+    /// its stdout as a JSON array.
+    ///
+    /// `gh`'s list subcommands (confirmed live against `gh` 2.83.0, e.g.
+    /// `gh label list --search <term> --json name` when `<term>` matches
+    /// nothing) print **nothing at all** on a zero-result list, not the
+    /// `[]` a `--json` consumer would expect — despite exiting `0`. Every
+    /// other JSON-returning call in this file (`gh api graphql`, `gh ...
+    /// view`) always emits a well-formed body, so this empty-stdout
+    /// carve-out is scoped to list subcommands specifically rather than
+    /// folded into [`ShellVcs::run_json`], where it would silently turn a
+    /// genuinely-empty single-object response (e.g. a `view` racing a
+    /// deletion) into a fabricated default instead of a loud error.
+    fn run_json_list<T: DeserializeOwned>(
+        &self,
+        program: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+    ) -> Result<Vec<T>, VcsError> {
+        let stdout = self.run_checked(program, args, cwd)?;
+        if stdout.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        serde_json::from_str(&stdout).map_err(|source| VcsError::InvalidJson {
+            command: command_line(program, args),
+            source,
+        })
+    }
+
     /// Run `binary --version` and report whether it succeeded.
     fn binary_available(&self, binary: &str) -> Result<(), VcsError> {
         match self.run(binary, &["--version"], None) {
@@ -573,7 +602,7 @@ impl Vcs for ShellVcs {
         );
 
         let issues: Vec<IssueNumberJson> =
-            self.run_json(&self.gh_binary, &args, None)?;
+            self.run_json_list(&self.gh_binary, &args, None)?;
 
         Ok(issues.into_iter().map(|issue| issue.number).collect())
     }
@@ -676,7 +705,7 @@ impl Vcs for ShellVcs {
             repo,
         );
         let existing: Vec<LabelJson> =
-            self.run_json(&self.gh_binary, &args, None)?;
+            self.run_json_list(&self.gh_binary, &args, None)?;
         if existing.iter().any(|found| found.name == label) {
             return Ok(());
         }
@@ -1529,6 +1558,19 @@ mod tests {
     }
 
     #[test]
+    fn list_open_issues_returns_nothing_when_gh_prints_truly_empty_stdout() {
+        // `gh issue list --json ...` (confirmed live against `gh` 2.83.0)
+        // prints nothing at all on a zero-result list -- not `[]` -- while
+        // still exiting 0. A parser that only accepts `[]` as "empty"
+        // would misread this success as a broken `VcsError::InvalidJson`.
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed("");
+        let vcs = shell_vcs(runner);
+
+        assert!(vcs.list_open_issues("owner/repo-a", 30).unwrap().is_empty());
+    }
+
+    #[test]
     fn list_open_issues_reports_a_failed_gh_call_rather_than_an_empty_board() {
         // An unreachable/unauthenticated `gh` must never look like "this
         // repo has no issues" -- a silently empty board would read as a
@@ -1618,6 +1660,37 @@ mod tests {
                 "owner/repo-a",
             ],
         );
+        assert_call(
+            &calls[1],
+            "gh",
+            &[
+                "label",
+                "create",
+                "gate:architecture",
+                "--color",
+                "ededed",
+                "--repo",
+                "owner/repo-a",
+            ],
+        );
+    }
+
+    #[test]
+    fn ensure_label_creates_a_label_when_search_returns_empty_stdout() {
+        // `gh label list --search <term> --json name` (confirmed live
+        // against `gh` 2.83.0) prints nothing at all -- not `[]` -- when
+        // the search matches zero labels, despite exiting 0. This is the
+        // guaranteed case on a repo's first-ever `ensure_label` call for
+        // any label, since none of the vocabulary exists yet.
+        let runner = Arc::new(FakeRunner::new());
+        runner.succeed("");
+        runner.succeed("");
+        let vcs = shell_vcs(runner.clone());
+
+        vcs.ensure_label("owner/repo-a", "gate:architecture").unwrap();
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
         assert_call(
             &calls[1],
             "gh",

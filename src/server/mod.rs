@@ -228,6 +228,7 @@ mod wire;
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -363,6 +364,11 @@ struct BoundProject {
 struct SharedState {
     global: GlobalConfig,
     vcs: Arc<ShellVcs>,
+    /// Where every registered project's own config file lives
+    /// (`crate::config::projects_config_dir`, §11.1) — keyed by project
+    /// name there rather than `project_dir`, so this is resolved once
+    /// here rather than re-derived per project.
+    projects_config_dir: PathBuf,
 }
 
 /// One MCP connection's handler — the `spec-flow` daemon as an
@@ -549,15 +555,17 @@ impl SpecFlowServer {
         let cwd = args.cwd.ok_or(ToolError::CwdRequired)?;
 
         // Off the async worker thread like every other `Vcs`/config-file
-        // read this handler reaches — `resolve_project` reads
-        // `<project_dir>/config.yaml` from disk, so it belongs in
+        // read this handler reaches — `resolve_project` reads the
+        // project's own config file from disk, so it belongs in
         // `blocking()` for the same reason `board`/`issue`'s reads do,
         // even though this one file is small.
         let global = self.shared.global.clone();
+        let projects_config_dir = self.shared.projects_config_dir.clone();
         let cwd_owned = cwd.clone();
-        let (pointer, config) =
-            blocking(move || logic::resolve_project(&global, &cwd_owned))
-                .await?;
+        let (pointer, config) = blocking(move || {
+            logic::resolve_project(&global, &projects_config_dir, &cwd_owned)
+        })
+        .await?;
 
         let effective = {
             let mut bound = self.lock_bound();
@@ -982,8 +990,13 @@ fn format_chain(error: &dyn std::error::Error) -> String {
 pub fn mcp_service(
     global: GlobalConfig,
     vcs: ShellVcs,
+    projects_config_dir: PathBuf,
 ) -> StreamableHttpService<SpecFlowServer, LocalSessionManager> {
-    let shared = Arc::new(SharedState { global, vcs: Arc::new(vcs) });
+    let shared = Arc::new(SharedState {
+        global,
+        vcs: Arc::new(vcs),
+        projects_config_dir,
+    });
 
     let mut config = StreamableHttpServerConfig::default();
     config.stateless_protocol_metadata_required = true;
@@ -1004,6 +1017,7 @@ pub fn mcp_service(
 pub async fn serve(
     global: GlobalConfig,
     vcs: ShellVcs,
+    projects_config_dir: PathBuf,
 ) -> Result<(), ServeError> {
     let addr = global.listen;
     if !addr.ip().is_loopback() {
@@ -1015,8 +1029,8 @@ pub async fn serve(
         .map_err(|source| ServeError::Bind { addr, source })?;
 
     let projects = global.projects.len();
-    let router =
-        axum::Router::new().nest_service(MCP_PATH, mcp_service(global, vcs));
+    let router = axum::Router::new()
+        .nest_service(MCP_PATH, mcp_service(global, vcs, projects_config_dir));
 
     tracing::info!(
         %addr,
@@ -1212,7 +1226,11 @@ mod tests {
             projects: Vec::new(),
         };
         let vcs = ShellVcs::new("git".to_string(), "gh".to_string());
-        let shared = Arc::new(SharedState { global, vcs: Arc::new(vcs) });
+        let shared = Arc::new(SharedState {
+            global,
+            vcs: Arc::new(vcs),
+            projects_config_dir: PathBuf::from("/tmp/unused"),
+        });
         let server = SpecFlowServer::new(shared);
 
         assert_eq!(

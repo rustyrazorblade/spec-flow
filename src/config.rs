@@ -8,9 +8,11 @@
 //!   TTL) plus the **project registry** (`projects`): a pointer list of
 //!   every project this daemon manages. `registry.rs` operates on that
 //!   list.
-//! - [`ProjectConfig`] — `<project_dir>/config.yaml`, one per registered
-//!   repo. That project's own settings: repo slug, paths, `gh` scoping,
-//!   merge mode, harness override, memory/index location.
+//! - [`ProjectConfig`] — `~/.config/spec-flow/projects/<name>.yaml`, one
+//!   per registered repo, keyed by the project's registry name rather
+//!   than its `project_dir` (see [`projects_config_dir`] for why). That
+//!   project's own settings: repo slug, paths, `gh` scoping, merge mode,
+//!   harness override, memory/index location.
 //!
 //! Neither file is committed to the project's git repository — both hold
 //! machine-local absolute paths and account names (§11). The committed,
@@ -104,8 +106,8 @@ pub enum ConfigError {
 ///
 /// A pointer only — `name` plus where the project lives on this machine.
 /// The project's actual settings (repo slug, paths, `gh` scoping, ...)
-/// live in that project's own `<project_dir>/config.yaml`, never
-/// duplicated here.
+/// live in that project's own config file (see [`project_config_path`]),
+/// never duplicated here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProjectPointer {
     /// The project handle (defaults to the project directory's name at
@@ -308,8 +310,8 @@ pub enum MergeMode {
     Serialized,
 }
 
-/// A single registered project's own settings:
-/// `<project_dir>/config.yaml` (§11.1).
+/// A single registered project's own settings, stored at
+/// [`project_config_path`] (§11.1).
 ///
 /// Written by `spec-flow init` (a later task, §14 step 9) run inside
 /// that repo. Machine-local and re-creatable — losing it costs only a
@@ -388,10 +390,34 @@ pub fn global_config_path() -> Result<PathBuf, ConfigError> {
         .join("config.yaml"))
 }
 
+/// The directory holding every registered project's own config file,
+/// `~/.config/spec-flow/projects/` (§11.1).
+///
+/// A sibling of [`global_config_path`]'s directory, not something
+/// derived from any project's own `project_dir`: `project_dir` is the
+/// sibling-worktree container (§10.1) and, under a layout where several
+/// projects share one container (e.g. every repo's primary checkout and
+/// worktrees living flat under one directory), is not unique per
+/// project — only a project's registry `name` is, which is why
+/// [`project_config_path`] takes this directory plus a `name` rather
+/// than a `project_dir`. Storing config here instead of inside
+/// `project_dir` also means it can never be accidentally swept into a
+/// `git add` of the project's own checkout.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::HomeDirUnavailable`] when `HOME` is unset.
+pub fn projects_config_dir() -> Result<PathBuf, ConfigError> {
+    let home =
+        std::env::var_os("HOME").ok_or(ConfigError::HomeDirUnavailable)?;
+    Ok(PathBuf::from(home).join(".config").join("spec-flow").join("projects"))
+}
+
 /// The path to a registered project's own config file,
-/// `<project_dir>/config.yaml` (§11.1).
-pub fn project_config_path(project_dir: &Path) -> PathBuf {
-    project_dir.join("config.yaml")
+/// `<projects_config_dir>/<name>.yaml` — see [`projects_config_dir`] for
+/// why this is keyed by `name` rather than `project_dir`.
+pub fn project_config_path(projects_config_dir: &Path, name: &str) -> PathBuf {
+    projects_config_dir.join(format!("{name}.yaml"))
 }
 
 /// Load the global daemon config from `path`.
@@ -621,11 +647,24 @@ mod tests {
     }
 
     #[test]
-    fn project_config_path_is_project_dir_slash_config_yaml() {
-        let project_dir = Path::new("/abs/path/to/repo-a");
+    fn project_config_path_is_dir_slash_name_dot_yaml() {
+        // Deliberately NOT `<project_dir>/config.yaml`: `project_dir` is
+        // not unique per project once several projects can share one
+        // sibling-worktree container (§10.1), but `name` always is.
+        let dir = Path::new("/abs/path/to/projects");
         assert_eq!(
-            project_config_path(project_dir),
-            PathBuf::from("/abs/path/to/repo-a/config.yaml")
+            project_config_path(dir, "repo-a"),
+            PathBuf::from("/abs/path/to/projects/repo-a.yaml")
         );
+    }
+
+    #[test]
+    fn projects_config_dir_is_a_sibling_of_the_global_config_file() {
+        let home = std::env::var_os("HOME").unwrap();
+        let expected = PathBuf::from(home)
+            .join(".config")
+            .join("spec-flow")
+            .join("projects");
+        assert_eq!(projects_config_dir().unwrap(), expected);
     }
 }

@@ -83,9 +83,16 @@ fn global_config(projects: Vec<ProjectPointer>) -> GlobalConfig {
     }
 }
 
-/// Write a real `<project_dir>/config.yaml` and return its registry
-/// pointer — `register` reads that file, so it has to exist on disk.
-fn register_project(dir: &Path, name: &str, repo: &str) -> ProjectPointer {
+/// Write a real project config file (under `configs_dir`, keyed by
+/// `name` — matching where a real server looks, since config storage is
+/// no longer inside `project_dir`) and return its registry pointer —
+/// `register` reads that file, so it has to exist on disk.
+fn register_project(
+    configs_dir: &Path,
+    dir: &Path,
+    name: &str,
+    repo: &str,
+) -> ProjectPointer {
     let config = ProjectConfig {
         name: name.to_string(),
         repo: repo.to_string(),
@@ -99,7 +106,8 @@ fn register_project(dir: &Path, name: &str, repo: &str) -> ProjectPointer {
         memory_scope: name.to_string(),
         weight: None,
     };
-    save_project_config(&project_config_path(dir), &config).unwrap();
+    save_project_config(&project_config_path(configs_dir, name), &config)
+        .unwrap();
     ProjectPointer { name: name.to_string(), project_dir: dir.to_path_buf() }
 }
 
@@ -136,14 +144,17 @@ phases:
 ///
 /// The `gh` binary is deliberately a name that cannot resolve — see this
 /// file's module doc.
-async fn spawn_server(global: GlobalConfig) -> SocketAddr {
+async fn spawn_server(
+    global: GlobalConfig,
+    projects_config_dir: &Path,
+) -> SocketAddr {
     let vcs = ShellVcs::new(
         "git".to_string(),
         "spec-flow-no-such-gh-binary".to_string(),
     );
     let router = axum::Router::new().nest_service(
         spec_flow::MCP_PATH,
-        spec_flow::mcp_service(global, vcs),
+        spec_flow::mcp_service(global, vcs, projects_config_dir.to_path_buf()),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -199,7 +210,8 @@ async fn the_handshake_announces_this_crate_not_the_sdk() {
     // whose `env!`s expand inside `rmcp` -- so the naive version of
     // `get_info` announces the server as "rmcp" 3.1.0. §14.1's
     // compatibility contract needs this crate's own name/version.
-    let addr = spawn_server(global_config(Vec::new())).await;
+    let addr =
+        spawn_server(global_config(Vec::new()), Path::new("unused")).await;
     let client = connect(addr).await;
 
     let info = client.peer_info().expect("peer info after handshake");
@@ -231,7 +243,8 @@ async fn the_handshake_negotiates_a_session_bearing_protocol_revision() {
     // per-request version outside it. What this test actually pins is
     // narrower: today's rmcp client defaults below 2026-07-28, so an
     // ordinary handshake never needs the fallback at all.
-    let addr = spawn_server(global_config(Vec::new())).await;
+    let addr =
+        spawn_server(global_config(Vec::new()), Path::new("unused")).await;
     let client = connect(addr).await;
 
     let info = client.peer_info().expect("peer info after handshake");
@@ -246,7 +259,8 @@ async fn the_handshake_negotiates_a_session_bearing_protocol_revision() {
 
 #[tokio::test]
 async fn the_server_advertises_exactly_this_slices_tools() {
-    let addr = spawn_server(global_config(Vec::new())).await;
+    let addr =
+        spawn_server(global_config(Vec::new()), Path::new("unused")).await;
     let client = connect(addr).await;
 
     let mut names: Vec<String> = client
@@ -279,8 +293,9 @@ async fn the_server_advertises_exactly_this_slices_tools() {
 #[tokio::test]
 async fn register_binds_the_connection_to_the_project_containing_cwd() {
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     let result = client
@@ -309,10 +324,11 @@ async fn register_resolves_a_worktree_inside_the_project() {
     // §10.1's realistic case: the coordinator is opened in
     // `<project_dir>/<branch>`, not in `<project_dir>` itself.
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
     let worktree = tmp.path().join("issue-42-widget-cache");
     std::fs::create_dir_all(&worktree).unwrap();
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     let result = client
@@ -337,9 +353,10 @@ async fn register_rejects_a_directory_outside_every_registered_project() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("a");
     std::fs::create_dir_all(&project).unwrap();
-    let pointer = register_project(&project, "proj-a", "owner/repo-a");
+    let pointer =
+        register_project(tmp.path(), &project, "proj-a", "owner/repo-a");
     let elsewhere = tmp.path().join("somewhere-else");
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     let error = client
@@ -366,7 +383,8 @@ async fn register_rejects_a_directory_outside_every_registered_project() {
 
 #[tokio::test]
 async fn register_rejects_a_coordinator_with_no_cwd() {
-    let addr = spawn_server(global_config(Vec::new())).await;
+    let addr =
+        spawn_server(global_config(Vec::new()), Path::new("unused")).await;
     let client = connect(addr).await;
 
     let error = client
@@ -385,8 +403,9 @@ async fn register_rejects_a_coordinator_with_no_cwd() {
 #[tokio::test]
 async fn register_rejects_a_spawn_token_rather_than_ignoring_it() {
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     let error = client
@@ -422,10 +441,10 @@ async fn a_connection_cannot_rebind_to_another_project() {
     std::fs::create_dir_all(&a).unwrap();
     std::fs::create_dir_all(&b).unwrap();
     let global = global_config(vec![
-        register_project(&a, "proj-a", "owner/repo-a"),
-        register_project(&b, "proj-b", "owner/repo-b"),
+        register_project(tmp.path(), &a, "proj-a", "owner/repo-a"),
+        register_project(tmp.path(), &b, "proj-b", "owner/repo-b"),
     ]);
-    let addr = spawn_server(global).await;
+    let addr = spawn_server(global, tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -482,10 +501,10 @@ async fn two_connections_bind_to_their_own_projects_independently() {
     std::fs::create_dir_all(&a).unwrap();
     std::fs::create_dir_all(&b).unwrap();
     let global = global_config(vec![
-        register_project(&a, "proj-a", "owner/repo-a"),
-        register_project(&b, "proj-b", "owner/repo-b"),
+        register_project(tmp.path(), &a, "proj-a", "owner/repo-a"),
+        register_project(tmp.path(), &b, "proj-b", "owner/repo-b"),
     ]);
-    let addr = spawn_server(global).await;
+    let addr = spawn_server(global, tmp.path()).await;
 
     let first = connect(addr).await;
     let second = connect(addr).await;
@@ -522,7 +541,8 @@ async fn two_connections_bind_to_their_own_projects_independently() {
 
 #[tokio::test]
 async fn board_and_issue_refuse_an_unregistered_connection() {
-    let addr = spawn_server(global_config(Vec::new())).await;
+    let addr =
+        spawn_server(global_config(Vec::new()), Path::new("unused")).await;
     let client = connect(addr).await;
 
     let board = client
@@ -546,8 +566,9 @@ async fn board_reaches_the_git_gh_layer_once_the_connection_is_bound() {
     // the whole point of the per-session handler instance -- and the
     // only thing left failing is the deliberately-missing `gh`.
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -580,8 +601,9 @@ async fn board_reaches_the_git_gh_layer_once_the_connection_is_bound() {
 #[tokio::test]
 async fn board_rejects_a_filter_rather_than_silently_ignoring_it() {
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -609,8 +631,9 @@ async fn board_rejects_a_filter_rather_than_silently_ignoring_it() {
 #[tokio::test]
 async fn issue_reaches_the_git_gh_layer_once_the_connection_is_bound() {
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -644,7 +667,8 @@ async fn issue_reaches_the_git_gh_layer_once_the_connection_is_bound() {
 async fn backlog_and_drift_refuse_an_unregistered_connection() {
     // §15's "project rides the connection": neither tool takes a
     // project argument, so without a binding there is nothing to act on.
-    let addr = spawn_server(global_config(Vec::new())).await;
+    let addr =
+        spawn_server(global_config(Vec::new()), Path::new("unused")).await;
     let client = connect(addr).await;
 
     let backlog = client
@@ -665,9 +689,10 @@ async fn backlog_and_drift_refuse_an_unregistered_connection() {
 #[tokio::test]
 async fn backlog_reaches_the_git_gh_layer_once_the_connection_is_bound() {
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
     scaffold_workflow(tmp.path());
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -706,8 +731,9 @@ async fn backlog_names_the_workflow_file_it_could_not_read() {
     // which path -- not fall back to the shipped default and report a
     // readiness bar the team does not use.
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -740,9 +766,10 @@ async fn backlog_names_the_workflow_file_it_could_not_read() {
 #[tokio::test]
 async fn backlog_rejects_a_filter_rather_than_silently_ignoring_it() {
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
     scaffold_workflow(tmp.path());
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -779,8 +806,9 @@ async fn drift_reaches_the_git_gh_layer_once_the_connection_is_bound() {
     // `drift()` takes no arguments at all (§6) -- the project rides the
     // connection, and every check runs project-wide by definition.
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -823,8 +851,9 @@ async fn issue_rejects_a_missing_number_argument() {
     // That is why this asserts on the result rather than `unwrap_err`,
     // unlike the tool bodies' own rejections above.
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -858,7 +887,8 @@ async fn approve_and_set_gate_refuse_an_unregistered_connection() {
     // the stakes are higher than for a read: without a binding there is
     // no repo to write a label to, and picking one would be the
     // cross-project act §15 forbids outright.
-    let addr = spawn_server(global_config(Vec::new())).await;
+    let addr =
+        spawn_server(global_config(Vec::new()), Path::new("unused")).await;
     let client = connect(addr).await;
 
     let approve = client
@@ -897,9 +927,10 @@ async fn approve_reaches_the_git_gh_layer_once_the_connection_is_bound() {
     // `gh` -- i.e. the write really is attempted against GitHub before
     // this tool returns (§15).
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
     scaffold_workflow(tmp.path());
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -944,9 +975,10 @@ async fn approve_rejects_a_phase_the_workflow_does_not_define() {
     // that would have worked -- and, crucially, happens before any `gh`
     // call, so a mistyped phase writes nothing.
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
     scaffold_workflow(tmp.path());
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -995,9 +1027,10 @@ async fn approve_rejects_a_decision_outside_grant_and_deny() {
     // two real branches. Like every parameter-decoding failure, `rmcp`
     // surfaces this as a successful call carrying `isError: true`.
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
     scaffold_workflow(tmp.path());
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -1032,9 +1065,10 @@ async fn approve_rejects_a_decision_outside_grant_and_deny() {
 #[tokio::test]
 async fn set_gate_reaches_the_git_gh_layer_once_the_connection_is_bound() {
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
     scaffold_workflow(tmp.path());
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -1075,7 +1109,8 @@ async fn set_gate_reaches_the_git_gh_layer_once_the_connection_is_bound() {
 async fn advance_refuses_an_unregistered_connection() {
     // §15's "project rides the connection", with a write tool's stakes:
     // without a binding there is no repo whose issue could be moved.
-    let addr = spawn_server(global_config(Vec::new())).await;
+    let addr =
+        spawn_server(global_config(Vec::new()), Path::new("unused")).await;
     let client = connect(addr).await;
 
     let error = client
@@ -1095,9 +1130,10 @@ async fn advance_reaches_the_git_gh_layer_once_the_connection_is_bound() {
     // really is read from GitHub before any decision is made (§2.3),
     // rather than the tool answering from anything local.
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
     scaffold_workflow(tmp.path());
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -1137,8 +1173,9 @@ async fn advance_names_the_workflow_file_it_could_not_read() {
     // `.spec-flow/workflow.yaml` fails naming that file and cannot have
     // written a half-applied status transition on the way.
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -1179,9 +1216,10 @@ async fn advance_rejects_a_missing_issue_number_argument() {
     // `isError: true`, not as a JSON-RPC error. Pinned so `issue_number`
     // can never quietly acquire a default and move issue #0.
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
     scaffold_workflow(tmp.path());
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
@@ -1217,9 +1255,10 @@ async fn set_gate_rejects_a_mode_outside_the_three_gate_modes() {
     // not decode. Same `isError: true` shape as every other decoding
     // failure.
     let tmp = tempfile::tempdir().unwrap();
-    let pointer = register_project(tmp.path(), "proj-a", "owner/repo-a");
+    let pointer =
+        register_project(tmp.path(), tmp.path(), "proj-a", "owner/repo-a");
     scaffold_workflow(tmp.path());
-    let addr = spawn_server(global_config(vec![pointer])).await;
+    let addr = spawn_server(global_config(vec![pointer]), tmp.path()).await;
     let client = connect(addr).await;
 
     client
